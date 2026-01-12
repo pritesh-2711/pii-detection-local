@@ -1,0 +1,12 @@
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.12.0
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.2.0
+seqeval>=1.2.2
+Faker>=18.0.0
+accelerate>=0.20.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+tqdm>=4.65.0

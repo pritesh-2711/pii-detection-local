@@ -143,6 +143,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.pii_venv/
+{data,models,notebooks,src}/
+
 
 # Spyder project settings
 .spyderproject
