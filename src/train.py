@@ -189,7 +189,7 @@ class PIITrainer:
         """
         print("\n=== Starting Training ===")
         
-        # Training arguments
+        # Training arguments - FIXED: eval_strategy instead of evaluation_strategy
         training_args = TrainingArguments(
             output_dir=str(self.output_dir),
             num_train_epochs=self.num_epochs,
@@ -197,7 +197,7 @@ class PIITrainer:
             per_device_eval_batch_size=self.batch_size,
             learning_rate=self.learning_rate,
             weight_decay=0.01,
-            evaluation_strategy="epoch",
+            eval_strategy="epoch",
             save_strategy="epoch",
             load_best_model_at_end=True,
             metric_for_best_model="f1",
@@ -291,7 +291,7 @@ def main():
     """
     # Configuration
     config = {
-        'model_name': 'bert-base-cased',  # or 'roberta-base', 'microsoft/deberta-v3-base'
+        'model_name': 'bert-base-cased',
         'data_dir': './data',
         'output_dir': './models',
         'max_length': 128,

@@ -1,111 +1,46 @@
-import requests
 import json
 import os
 from pathlib import Path
 from typing import List, Dict, Tuple
 import pandas as pd
-from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
-class PIIDataCollector:
+class SimplePIIDataCollector:
     """
-    Collects and prepares PII datasets for training.
-    Uses public datasets: CoNLL-2003, WikiANN, and synthetic PII data.
+    Simplified data collector that only uses synthetic data.
+    Use this if CoNLL-2003 loading fails.
     """
     
     def __init__(self, data_dir: str = "./data"):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
-        # PII entity labels (BIO format)
         self.pii_labels = [
             "O",
-            "B-PERSON",
-            "I-PERSON",
-            "B-EMAIL",
-            "I-EMAIL",
-            "B-PHONE",
-            "I-PHONE",
-            "B-SSN",
-            "I-SSN",
-            "B-CC",
-            "I-CC",
-            "B-ADDRESS",
-            "I-ADDRESS",
-            "B-DATE",
-            "I-DATE",
-            "B-ORG",
-            "I-ORG",
-            "B-LOC",
-            "I-LOC"
+            "B-PERSON", "I-PERSON",
+            "B-EMAIL", "I-EMAIL",
+            "B-PHONE", "I-PHONE",
+            "B-SSN", "I-SSN",
+            "B-CC", "I-CC",
+            "B-ADDRESS", "I-ADDRESS",
+            "B-DATE", "I-DATE",
+            "B-ORG", "I-ORG",
+            "B-LOC", "I-LOC"
         ]
-        
-    def download_conll2003(self) -> pd.DataFrame:
-        """
-        Download CoNLL-2003 dataset (contains PERSON, ORG, LOC).
-        """
-        print("Downloading CoNLL-2003 dataset...")
-        
-        try:
-            # FIXED: Added trust_remote_code=True for newer datasets library
-            dataset = load_dataset("conll2003", trust_remote_code=True)
-            
-            # Convert to our format
-            data = []
-            for split in ['train', 'validation', 'test']:
-                for example in dataset[split]:
-                    tokens = example['tokens']
-                    ner_tags = example['ner_tags']
-                    
-                    # Convert CoNLL tags to our PII tags
-                    labels = self._convert_conll_tags(ner_tags)
-                    
-                    data.append({
-                        'tokens': tokens,
-                        'labels': labels,
-                        'split': split
-                    })
-            
-            df = pd.DataFrame(data)
-            print(f"CoNLL-2003 loaded: {len(df)} examples")
-            return df
-            
-        except Exception as e:
-            print(f"Error loading CoNLL-2003: {e}")
-            print("Continuing with synthetic data only...")
-            return pd.DataFrame()
     
-    def _convert_conll_tags(self, ner_tags: List[int]) -> List[str]:
+    def generate_synthetic_pii(self, n_samples: int = 10000) -> pd.DataFrame:
         """
-        Convert CoNLL-2003 NER tags to our PII label scheme.
-        CoNLL tags: 0=O, 1=B-PER, 2=I-PER, 3=B-ORG, 4=I-ORG, 5=B-LOC, 6=I-LOC, 7=B-MISC, 8=I-MISC
-        """
-        tag_map = {
-            0: "O",
-            1: "B-PERSON",
-            2: "I-PERSON",
-            3: "B-ORG",
-            4: "I-ORG",
-            5: "B-LOC",
-            6: "I-LOC",
-            7: "O",
-            8: "O"
-        }
-        return [tag_map.get(tag, "O") for tag in ner_tags]
-    
-    def generate_synthetic_pii(self, n_samples: int = 5000) -> pd.DataFrame:
-        """
-        Generate synthetic PII examples for email, phone, SSN, credit card, dates.
+        Generate synthetic PII examples.
         """
         print(f"Generating {n_samples} synthetic PII examples...")
         
         from faker import Faker
         import random
-        import re
         
         fake = Faker()
         data = []
         
+        # Expanded templates for more variety
         templates = [
             "My email is {email} and phone is {phone}.",
             "Contact me at {email} or call {phone}.",
@@ -117,12 +52,30 @@ class PIIDataCollector:
             "Patient: {name}, DOB: {dob}, SSN: {ssn}",
             "Shipping to {address} for {name}.",
             "Credit card {cc} belongs to {name}.",
+            "Call {name} at {phone} for more information.",
+            "Email {email} to reach {org} customer service.",
+            "{name} lives in {loc} and works at {org}.",
+            "The meeting is on {date} at {address}.",
+            "Contact {org} at {phone} or visit {address}.",
+            "Send payment to {name} using card {cc}.",
+            "Patient {name} visited on {date}.",
+            "{name} from {loc} joined {org} recently.",
+            "My phone number is {phone}.",
+            "You can email me at {email}.",
+            "I was born on {dob}.",
+            "The company {org} is located in {loc}.",
+            "{name} works as a developer.",
+            "Call customer support at {phone}.",
+            "My address is {address}.",
+            "Social Security Number: {ssn}",
+            "Meeting with {name} and {org} representatives.",
+            "Card ending in {cc}.",
+            "Visit us at {address} in {loc}.",
         ]
         
         for _ in range(n_samples):
             template = random.choice(templates)
             
-            # Generate PII values
             pii_values = {
                 'email': fake.email(),
                 'phone': fake.phone_number(),
@@ -132,10 +85,10 @@ class PIIDataCollector:
                 'date': fake.date(),
                 'address': fake.address().replace('\n', ', '),
                 'name': fake.name(),
-                'org': fake.company()
+                'org': fake.company(),
+                'loc': fake.city()
             }
             
-            # Fill template
             text = template
             entities = []
             
@@ -144,7 +97,6 @@ class PIIDataCollector:
                     start = text.find('{' + key + '}')
                     text = text.replace('{' + key + '}', value, 1)
                     
-                    # Map key to label type
                     label_map = {
                         'email': 'EMAIL',
                         'phone': 'PHONE',
@@ -154,7 +106,8 @@ class PIIDataCollector:
                         'date': 'DATE',
                         'address': 'ADDRESS',
                         'name': 'PERSON',
-                        'org': 'ORG'
+                        'org': 'ORG',
+                        'loc': 'LOC'
                     }
                     
                     entities.append({
@@ -163,7 +116,6 @@ class PIIDataCollector:
                         'label': label_map[key]
                     })
             
-            # Tokenize and create BIO labels
             tokens, labels = self._tokenize_and_label(text, entities)
             
             data.append({
@@ -178,13 +130,11 @@ class PIIDataCollector:
     
     def _tokenize_and_label(self, text: str, entities: List[Dict]) -> Tuple[List[str], List[str]]:
         """
-        Tokenize text and assign BIO labels based on entity positions.
+        Tokenize text and assign BIO labels.
         """
-        # Simple whitespace tokenization
         tokens = text.split()
         labels = ["O"] * len(tokens)
         
-        # Track character positions
         char_to_token = {}
         char_pos = 0
         for token_idx, token in enumerate(tokens):
@@ -194,7 +144,6 @@ class PIIDataCollector:
                 char_to_token[i] = token_idx
             char_pos = token_end
         
-        # Assign labels based on entities
         for entity in entities:
             start_token = char_to_token.get(entity['start'])
             end_token = char_to_token.get(entity['end'] - 1)
@@ -202,35 +151,23 @@ class PIIDataCollector:
             if start_token is not None and end_token is not None:
                 labels[start_token] = f"B-{entity['label']}"
                 for i in range(start_token + 1, end_token + 1):
-                    labels[i] = f"I-{entity['label']}"
+                    if i < len(labels):
+                        labels[i] = f"I-{entity['label']}"
         
         return tokens, labels
     
-    def prepare_dataset(self) -> Dict[str, pd.DataFrame]:
+    def prepare_dataset(self, n_samples: int = 10000) -> Dict[str, pd.DataFrame]:
         """
-        Combine all datasets and split into train/val/test.
+        Generate and split dataset.
         """
-        print("\n=== Preparing Full Dataset ===")
+        print("\n=== Preparing Synthetic Dataset ===")
         
-        # Collect data from multiple sources
-        conll_df = self.download_conll2003()
-        synthetic_df = self.generate_synthetic_pii(n_samples=5000)
+        # Generate synthetic data
+        all_data = self.generate_synthetic_pii(n_samples=n_samples)
         
-        # Combine
-        all_data = pd.concat([conll_df, synthetic_df], ignore_index=True)
-        
-        # Split by existing splits or create new ones
-        train_df = all_data[all_data['split'] == 'train'].reset_index(drop=True)
-        val_df = all_data[all_data['split'] == 'validation'].reset_index(drop=True)
-        test_df = all_data[all_data['split'] == 'test'].reset_index(drop=True)
-        
-        # If validation is empty, create from train
-        if len(val_df) == 0:
-            train_df, val_df = train_test_split(train_df, test_size=0.1, random_state=42)
-        
-        # If test is empty, create from train
-        if len(test_df) == 0:
-            train_df, test_df = train_test_split(train_df, test_size=0.1, random_state=42)
+        # Split: 80% train, 10% val, 10% test
+        train_df, temp_df = train_test_split(all_data, test_size=0.2, random_state=42)
+        val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42)
         
         print(f"\nDataset splits:")
         print(f"  Train: {len(train_df)}")
@@ -262,5 +199,5 @@ class PIIDataCollector:
         }
 
 if __name__ == "__main__":
-    collector = PIIDataCollector(data_dir="./data")
-    datasets = collector.prepare_dataset()
+    collector = SimplePIIDataCollector(data_dir="./data")
+    datasets = collector.prepare_dataset(n_samples=10000)
