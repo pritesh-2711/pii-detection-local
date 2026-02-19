@@ -212,4 +212,5 @@ __marimo__/
 #Models
 data/
 models/
-notebooks/
+# notebooks/
+pii_datasets/
