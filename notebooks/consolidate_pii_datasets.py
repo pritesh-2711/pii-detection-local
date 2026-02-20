@@ -13,18 +13,19 @@ Output schema (one JSON object per line):
   }
 
 Usage:
-  python consolidate_pii_datasets.py \
-      --data-dir ./pii_datasets \
-      --output-dir ./pii_datasets/consolidated
-
-Example:
     python notebooks/consolidate_pii_datasets.py \
         --data-dir notebooks/pii_datasets \
         --output-dir notebooks/pii_datasets/consolidated
+
+Fixes vs original:
+  - few_nerd: fewnerd_labels now use B-/I- prefixes so BIO tagging is preserved.
+  - nvidia/Nemotron-PII: span_to_bio extended to handle 'start_index'/'end_index'
+    and additional label key variants used by Nemotron spans.
+  - parse_span_field: also handles list-of-lists (Nemotron nested format).
+  - span_to_bio: falls back to character search when exact char offset misses.
 """
 
 import json
-import re
 import argparse
 from pathlib import Path
 from collections import defaultdict
@@ -32,8 +33,6 @@ from collections import defaultdict
 # ---------------------------------------------------------------------------
 # Entity label normalisation map
 # ---------------------------------------------------------------------------
-# Every source uses different label names for the same concept.
-# This maps all variants to a single canonical label set.
 LABEL_NORM = {
     # Person
     "PER": "PERSON", "B-PER": "B-PERSON", "I-PER": "I-PERSON",
@@ -47,11 +46,21 @@ LABEL_NORM = {
     "DOB": "DATE", "B-DOB": "B-DATE", "I-DOB": "I-DATE",
     "EYECOLOR": "PERSON", "B-EYECOLOR": "B-PERSON", "I-EYECOLOR": "I-PERSON",
     "HEIGHT": "PERSON", "B-HEIGHT": "B-PERSON", "I-HEIGHT": "I-PERSON",
+    # few-nerd coarse labels (lowercase, decoded from integers — no B-/I- yet)
+    "person": "PERSON",
+    "organization": "ORG",
+    "location": "LOC",
+    "other": "MISC",
+    "art": "MISC",
+    "building": "LOC",
+    "event": "MISC",
+    "product": "MISC",
 
     # Organisation
     "ORG": "ORG",
     "COMPANYNAME": "ORG", "B-COMPANYNAME": "B-ORG", "I-COMPANYNAME": "I-ORG",
     "ACCOUNTNAME": "ORG", "B-ACCOUNTNAME": "B-ORG", "I-ACCOUNTNAME": "I-ORG",
+    "COMPANY": "ORG", "B-COMPANY": "B-ORG", "I-COMPANY": "I-ORG",
 
     # Location
     "LOC": "LOC",
@@ -72,12 +81,14 @@ LABEL_NORM = {
     "PHONENUMBER": "PHONE", "B-PHONENUMBER": "B-PHONE", "I-PHONENUMBER": "I-PHONE",
     "PHONE": "PHONE",
     "PHONEIMEI": "PHONE", "B-PHONEIMEI": "B-PHONE", "I-PHONEIMEI": "I-PHONE",
+    "PHONE_NUMBER": "PHONE", "B-PHONE_NUMBER": "B-PHONE", "I-PHONE_NUMBER": "I-PHONE",
 
     # Financial identifiers
     "CREDITCARDNUMBER": "CREDIT_CARD", "B-CREDITCARDNUMBER": "B-CREDIT_CARD", "I-CREDITCARDNUMBER": "I-CREDIT_CARD",
     "CREDITCARDCVV": "CREDIT_CARD", "B-CREDITCARDCVV": "B-CREDIT_CARD", "I-CREDITCARDCVV": "I-CREDIT_CARD",
     "CREDITCARDISSUER": "CREDIT_CARD", "B-CREDITCARDISSUER": "B-CREDIT_CARD", "I-CREDITCARDISSUER": "I-CREDIT_CARD",
     "CREDIT_CARD": "CREDIT_CARD",
+    "CREDIT_CARD_NUMBER": "CREDIT_CARD", "B-CREDIT_CARD_NUMBER": "B-CREDIT_CARD", "I-CREDIT_CARD_NUMBER": "I-CREDIT_CARD",
     "IBAN": "IBAN",
     "BIC": "BIC",
     "ACCOUNTNUMBER": "ACCOUNT_NUMBER", "B-ACCOUNTNUMBER": "B-ACCOUNT_NUMBER", "I-ACCOUNTNUMBER": "I-ACCOUNT_NUMBER",
@@ -126,31 +137,16 @@ LABEL_NORM = {
     "VEHICLEVRM": "VEHICLE", "B-VEHICLEVRM": "B-VEHICLE", "I-VEHICLEVRM": "I-VEHICLE",
     "VEHI": "VEHICLE", "B-VEHI": "B-VEHICLE", "I-VEHI": "I-VEHICLE",
 
-    # Other multinerd / few-nerd types kept as-is (no PII relevance, pass through)
-    "MISC": "MISC",
+    # multinerd types
     "ANIM": "MISC", "BIO": "MISC", "CEL": "MISC", "DIS": "MISC",
     "EVE": "MISC", "FOOD": "MISC", "INST": "MISC", "MEDIA": "MISC",
     "MYTH": "MISC", "PLANT": "MISC",
 
-    # FiNER-139 financial numeric entities — kept as FINANCIAL_ENTITY
-    # (these are XBRL tags like Revenue, Assets, etc.)
-}
-
-# Canonical entity types that are PII-relevant for banking
-BANKING_PII_TYPES = {
-    "PERSON", "ORG", "LOC", "ADDRESS", "EMAIL", "PHONE",
-    "CREDIT_CARD", "IBAN", "BIC", "ACCOUNT_NUMBER", "ROUTING_NUMBER",
-    "PIN", "TAX_ID", "SSN", "AMOUNT", "CURRENCY", "CRYPTO_ADDRESS",
-    "IP_ADDRESS", "USERNAME", "PASSWORD", "URL", "DATE", "TIME",
-    "JOB", "VEHICLE", "MISC",
+    "MISC": "MISC",
 }
 
 
 def normalise_label(label: str) -> str:
-    """
-    Normalise a BIO label to the canonical label set.
-    Handles B-/I- prefixes and unknown labels.
-    """
     if label == "O":
         return "O"
 
@@ -160,11 +156,10 @@ def normalise_label(label: str) -> str:
         prefix = label[:2]
         base = label[2:]
 
-    # Direct lookup with prefix
+    # Direct lookup with full key (handles pre-prefixed entries in LABEL_NORM)
     full_key = prefix + base
     if full_key in LABEL_NORM:
         normed = LABEL_NORM[full_key]
-        # If the norm result already has a prefix, return as-is
         if normed.startswith("B-") or normed.startswith("I-"):
             return normed
         return prefix + normed
@@ -176,51 +171,107 @@ def normalise_label(label: str) -> str:
             return normed
         return prefix + normed
 
-    # Unknown — treat as FINANCIAL_ENTITY if it looks like an XBRL tag
-    # (starts with uppercase, camelCase, no dash)
-    if base and base[0].isupper() and "-" not in base:
+    # Lowercase base lookup (catches few-nerd decoded strings passed with a prefix)
+    if base.lower() in LABEL_NORM:
+        normed = LABEL_NORM[base.lower()]
+        if normed.startswith("B-") or normed.startswith("I-"):
+            return normed
+        return prefix + normed
+
+    # XBRL / unknown camelCase -> FINANCIAL_ENTITY
+    if base and base[0].isupper() and "-" not in base and "_" not in base:
         return prefix + "FINANCIAL_ENTITY"
 
     return prefix + base.upper()
 
 
 # ---------------------------------------------------------------------------
-# Span-to-BIO converter (for gretel and nvidia datasets)
+# Span-to-BIO converter
 # ---------------------------------------------------------------------------
 
-def span_to_bio(text: str, spans: list) -> tuple[list, list]:
+def span_to_bio(text: str, spans: list) -> tuple:
     """
-    Convert a raw text + list of character-offset spans into
-    whitespace-tokenised tokens and BIO labels.
+    Convert raw text + character-offset spans into whitespace-tokenised
+    tokens and BIO labels.
 
-    Each span is expected to be a dict with keys:
-      - 'start' / 'begin': int  (char offset, inclusive)
-      - 'end':             int  (char offset, exclusive)
-      - 'type' / 'label' / 'entity_type': str
+    Handles span dicts with keys:
+      start / begin / char_start / start_index / startIndex
+      end   / char_end / end_index / endIndex
+      type  / label / entity_type / tag / pii_type / category / ner_tag
     """
     tokens = text.split()
     labels = ["O"] * len(tokens)
 
-    # Build char-offset -> token index map
+    if not tokens:
+        return tokens, labels
+
+    # Build char-offset -> token-index map
     char_to_tok = {}
     pos = 0
     for tok_idx, tok in enumerate(tokens):
-        start = text.find(tok, pos)
-        for c in range(start, start + len(tok)):
+        start_pos = text.find(tok, pos)
+        if start_pos == -1:
+            pos += 1
+            continue
+        for c in range(start_pos, start_pos + len(tok)):
             char_to_tok[c] = tok_idx
-        pos = start + len(tok)
+        pos = start_pos + len(tok)
 
     for span in spans:
-        # Normalise span dict keys
-        start = span.get("start", span.get("begin", span.get("char_start")))
-        end = span.get("end", span.get("char_end"))
-        label = span.get("type", span.get("label", span.get("entity_type", span.get("tag", ""))))
+        if not isinstance(span, dict):
+            continue
+
+        # Resolve start offset
+        start = (
+            span.get("start") or span.get("begin") or span.get("char_start")
+            or span.get("start_index") or span.get("startIndex")
+            or span.get("offset")
+        )
+        # Resolve end offset
+        end = (
+            span.get("end") or span.get("char_end")
+            or span.get("end_index") or span.get("endIndex")
+        )
+        # Resolve label
+        label = (
+            span.get("type") or span.get("label") or span.get("entity_type")
+            or span.get("tag") or span.get("pii_type") or span.get("category")
+            or span.get("ner_tag") or span.get("entity_label") or span.get("class")
+        )
 
         if start is None or end is None or not label:
+            # Last resort: if span has 'value', try to find it in text
+            value = span.get("value") or span.get("text") or span.get("surface_form")
+            label = label or span.get("entity") or ""
+            if value and label:
+                idx = text.find(str(value))
+                if idx != -1:
+                    start = idx
+                    end = idx + len(str(value))
+                else:
+                    continue
+            else:
+                continue
+
+        try:
+            start, end = int(start), int(end)
+        except (TypeError, ValueError):
             continue
 
         first_tok = char_to_tok.get(start)
         last_tok = char_to_tok.get(end - 1)
+
+        # Fallback: if exact char not in map, scan nearby chars
+        if first_tok is None:
+            for offset in range(0, 5):
+                first_tok = char_to_tok.get(start + offset)
+                if first_tok is not None:
+                    break
+        if last_tok is None:
+            for offset in range(0, 5):
+                last_tok = char_to_tok.get(end - 1 - offset)
+                if last_tok is not None:
+                    break
 
         if first_tok is None or last_tok is None:
             continue
@@ -234,27 +285,36 @@ def span_to_bio(text: str, spans: list) -> tuple[list, list]:
 
 def parse_span_field(raw) -> list:
     """
-    Parse the pii_spans / spans column which may be a JSON string or a list.
-    Returns a flat list of span dicts.
+    Parse the pii_spans / spans column which may be a JSON string, a list,
+    or a list of lists (Nemotron nested format).
     """
     if raw is None:
         return []
     if isinstance(raw, list):
-        # Could be list of dicts or list of lists
         result = []
         for item in raw:
             if isinstance(item, dict):
                 result.append(item)
+            elif isinstance(item, list):
+                # Nemotron sometimes stores spans as [[start, end, label], ...]
+                if len(item) >= 3:
+                    result.append({"start": item[0], "end": item[1], "type": item[2]})
             elif isinstance(item, str):
                 try:
-                    result.append(json.loads(item))
+                    parsed = json.loads(item)
+                    if isinstance(parsed, dict):
+                        result.append(parsed)
+                    elif isinstance(parsed, list):
+                        result.extend(parsed)
                 except Exception:
                     pass
         return result
     if isinstance(raw, str):
         try:
             parsed = json.loads(raw)
-            return parsed if isinstance(parsed, list) else [parsed]
+            if isinstance(parsed, list):
+                return parse_span_field(parsed)
+            return [parsed]
         except Exception:
             return []
     return []
@@ -267,8 +327,7 @@ def parse_span_field(raw) -> list:
 def read_bio_jsonl(filepath: Path, token_col: str, label_col: str,
                    source: str, label_names: list = None) -> list:
     """
-    Generic reader for datasets that already have tokens + BIO labels as lists.
-    label_names: if labels are integers, this list maps id -> label string.
+    Generic reader for datasets with tokens + BIO labels (or integer ids).
     """
     records = []
     with open(filepath) as f:
@@ -282,20 +341,66 @@ def read_bio_jsonl(filepath: Path, token_col: str, label_col: str,
             if not tokens or not labels:
                 continue
 
-            # Decode integer labels
             if label_names and labels and isinstance(labels[0], int):
                 labels = [label_names[i] if i < len(label_names) else "O" for i in labels]
 
-            # Normalise
             labels = [normalise_label(str(l)) for l in labels]
 
-            if len(tokens) != len(labels):
-                # Truncate to shorter — shouldn't happen often
-                min_len = min(len(tokens), len(labels))
-                tokens = tokens[:min_len]
-                labels = labels[:min_len]
+            min_len = min(len(tokens), len(labels))
+            records.append({
+                "tokens": tokens[:min_len],
+                "labels": labels[:min_len],
+                "source": source,
+            })
+    return records
 
-            records.append({"tokens": tokens, "labels": labels, "source": source})
+
+def read_bio_jsonl_fewnerd(filepath: Path, source: str, label_names: list) -> list:
+    """
+    FIX: few-nerd reader.
+
+    The original script decoded integers to coarse label strings like "person"
+    (no B-/I- prefix) and passed them directly to normalise_label, which then
+    returned "PERSON" (no prefix). This broke BIO structure entirely.
+
+    Correct approach: integer 0 = O, odd = B-*, even(>0) = I-*.
+    We reconstruct BIO by looking at the fine_ner_tags column to decide
+    B vs I, or use the coarse ner_tags with run-length encoding.
+    """
+    records = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            tokens = row.get("tokens")
+            ner_tags = row.get("ner_tags")
+            if not tokens or ner_tags is None:
+                continue
+
+            labels = []
+            prev_label = None
+            for tag_id in ner_tags:
+                if tag_id == 0:
+                    labels.append("O")
+                    prev_label = None
+                else:
+                    raw_label = label_names[tag_id] if tag_id < len(label_names) else "other"
+                    canonical = normalise_label(raw_label)
+                    # Assign B- if this is the start of a new entity span, I- if continuing
+                    if prev_label == canonical:
+                        labels.append(f"I-{canonical}")
+                    else:
+                        labels.append(f"B-{canonical}")
+                    prev_label = canonical
+
+            min_len = min(len(tokens), len(labels))
+            records.append({
+                "tokens": tokens[:min_len],
+                "labels": labels[:min_len],
+                "source": source,
+            })
     return records
 
 
@@ -324,18 +429,78 @@ def read_span_jsonl(filepath: Path, text_col: str, span_col: str, source: str) -
     return records
 
 
-# ---------------------------------------------------------------------------
-# finer-139 label names (279 labels = 139 entity types in BIO)
-# We load these dynamically from the first file's feature metadata if available,
-# otherwise fall through to LABEL_NORM which maps unknowns to FINANCIAL_ENTITY.
-# ---------------------------------------------------------------------------
+def read_nvidia_jsonl(filepath: Path) -> list:
+    """
+    FIX: nvidia/Nemotron-PII reader.
 
-FINER_LABEL_NAMES = None  # populated lazily from first row if labels are ints
+    The dataset stores spans in the 'spans' column. The original span_to_bio
+    only checked start/begin/char_start for offsets. Nemotron uses
+    'start'/'end' (confirmed from dataset card) but some rows store the field
+    as a JSON string rather than a parsed list. Additionally, 'text_tagged'
+    provides a tagged version which we use as fallback.
+
+    This reader also tries parsing entity labels from 'text_tagged' if
+    'spans' yields no entities, using a simple regex over XML-like tags.
+    """
+    import re
+    tag_re = re.compile(r'<(\w+)>(.*?)</\1>', re.DOTALL)
+
+    records = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            text = row.get("text", "")
+            spans_raw = row.get("spans")
+            if not text:
+                continue
+
+            spans = parse_span_field(spans_raw)
+            tokens, labels = span_to_bio(text, spans)
+            labels = [normalise_label(l) for l in labels]
+
+            # Fallback: if no entities found and text_tagged is available, parse tags
+            has_entities = any(l != "O" for l in labels)
+            if not has_entities:
+                text_tagged = row.get("text_tagged", "")
+                if text_tagged:
+                    fallback_spans = []
+                    # Strip tags to get clean text, track offsets
+                    clean = ""
+                    cursor = 0
+                    remaining = text_tagged
+                    while remaining:
+                        m = re.search(r'<(\w+)>(.*?)</\1>', remaining, re.DOTALL)
+                        if not m:
+                            clean += remaining
+                            break
+                        clean += remaining[:m.start()]
+                        entity_start = len(clean)
+                        entity_text = m.group(2)
+                        clean += entity_text
+                        entity_end = len(clean)
+                        entity_type = m.group(1)
+                        fallback_spans.append({
+                            "start": entity_start,
+                            "end": entity_end,
+                            "type": entity_type,
+                        })
+                        remaining = remaining[m.end():]
+
+                    if fallback_spans and clean.strip():
+                        tokens, labels = span_to_bio(clean, fallback_spans)
+                        labels = [normalise_label(l) for l in labels]
+
+            if tokens:
+                records.append({"tokens": tokens, "labels": labels, "source": "nvidia_nemotron"})
+    return records
+
 
 def read_finer_jsonl(filepath: Path) -> list:
     """
-    Special reader for finer-139 where ner_tags are integer ClassLabels
-    but we don't have the label list at hand. We detect and handle it.
+    finer-139: integer tags, 0=O, odd=B-FINANCIAL_ENTITY, even(>0)=I-FINANCIAL_ENTITY.
     """
     records = []
     with open(filepath) as f:
@@ -349,35 +514,25 @@ def read_finer_jsonl(filepath: Path) -> list:
             if not tokens or ner_tags is None:
                 continue
 
-            # finer-139 stores tags as ints; we don't have the name list in JSONL.
-            # Tag 0 = O, odd = B-*, even(>0) = I-*  (IOB2, 279 labels for 139 types)
-            # We can't decode the specific XBRL name without the feature metadata,
-            # so we map all non-O tags to FINANCIAL_ENTITY.
             labels = []
-            prev_nonzero = False
             for tag in ner_tags:
                 if tag == 0:
                     labels.append("O")
-                    prev_nonzero = False
-                elif tag % 2 == 1:  # B- tags are odd indices (1,3,5,...)
+                elif tag % 2 == 1:
                     labels.append("B-FINANCIAL_ENTITY")
-                    prev_nonzero = True
-                else:  # I- tags are even indices (2,4,6,...)
+                else:
                     labels.append("I-FINANCIAL_ENTITY")
-                    prev_nonzero = True
 
             records.append({"tokens": tokens, "labels": labels, "source": "finer_139"})
     return records
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Reporting
 # ---------------------------------------------------------------------------
 
-def collect_unique_entities(all_records: list) -> dict:
-    """
-    Returns {source: set_of_canonical_entity_types} and a global set.
-    """
+def collect_unique_entities(all_records: list) -> tuple:
+    from collections import Counter
     per_source = defaultdict(set)
     global_types = set()
 
@@ -392,16 +547,17 @@ def collect_unique_entities(all_records: list) -> dict:
     return per_source, global_types
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main(data_dir: Path, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_records = []
     load_errors = []
 
-    # ------------------------------------------------------------------
     # 1. ai4privacy/pii-masking-400k
-    #    tokens: mbert_tokens  |  labels: mbert_token_classes (BIO strings)
-    # ------------------------------------------------------------------
     p = data_dir / "ai4privacy_400k" / "train.jsonl"
     if p.exists():
         print(f"Reading {p} ...")
@@ -411,10 +567,7 @@ def main(data_dir: Path, output_dir: Path):
     else:
         load_errors.append(str(p))
 
-    # ------------------------------------------------------------------
     # 2. ai4privacy/pii-masking-300k
-    #    tokens: mbert_text_tokens  |  labels: mbert_bio_labels (BIO strings)
-    # ------------------------------------------------------------------
     p = data_dir / "ai4privacy_300k" / "train.jsonl"
     if p.exists():
         print(f"Reading {p} ...")
@@ -424,10 +577,7 @@ def main(data_dir: Path, output_dir: Path):
     else:
         load_errors.append(str(p))
 
-    # ------------------------------------------------------------------
     # 3. gretelai/synthetic_pii_finance_multilingual
-    #    text: generated_text  |  spans: pii_spans (JSON char offsets)
-    # ------------------------------------------------------------------
     for split in ["train", "test"]:
         p = data_dir / "gretel_finance" / f"{split}.jsonl"
         if p.exists():
@@ -436,24 +586,17 @@ def main(data_dir: Path, output_dir: Path):
             print(f"  {len(recs):,} records")
             all_records.extend(recs)
 
-    # ------------------------------------------------------------------
-    # 4. nvidia/Nemotron-PII
-    #    text: text  |  spans: spans (JSON char offsets)
-    # ------------------------------------------------------------------
+    # 4. nvidia/Nemotron-PII  [FIXED]
     p = data_dir / "nvidia_nemotron" / "train.jsonl"
     if p.exists():
         print(f"Reading {p} ...")
-        recs = read_span_jsonl(p, "text", "spans", "nvidia_nemotron")
+        recs = read_nvidia_jsonl(p)
         print(f"  {len(recs):,} records")
         all_records.extend(recs)
     else:
         load_errors.append(str(p))
 
-    # ------------------------------------------------------------------
     # 5. wikiann (en)
-    #    tokens: tokens  |  labels: ner_tags (ClassLabel integers)
-    #    label names: ['O','B-PER','I-PER','B-ORG','I-ORG','B-LOC','I-LOC']
-    # ------------------------------------------------------------------
     wikiann_labels = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"]
     for split in ["train", "validation", "test"]:
         p = data_dir / "wikiann" / f"{split}.jsonl"
@@ -463,10 +606,7 @@ def main(data_dir: Path, output_dir: Path):
             print(f"  {len(recs):,} records")
             all_records.extend(recs)
 
-    # ------------------------------------------------------------------
-    # 6. Babelscape/multinerd (en only, already filtered)
-    #    tokens: tokens  |  labels: ner_tags (raw integers)
-    # ------------------------------------------------------------------
+    # 6. Babelscape/multinerd (en)
     multinerd_labels = [
         "O",
         "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC",
@@ -484,25 +624,19 @@ def main(data_dir: Path, output_dir: Path):
     else:
         load_errors.append(str(p))
 
-    # ------------------------------------------------------------------
-    # 7. DFKI-SLT/few-nerd (supervised)
-    #    tokens: tokens  |  labels: ner_tags (ClassLabel integers)
-    #    coarse labels only (8 types); fine_ner_tags skipped
-    # ------------------------------------------------------------------
+    # 7. DFKI-SLT/few-nerd  [FIXED]
+    # Coarse label names — integer 0=O, 1=art, 2=building, ... 8=product
     fewnerd_labels = ["O", "art", "building", "event", "location",
                       "organization", "other", "person", "product"]
     for split in ["train", "validation", "test"]:
         p = data_dir / "few_nerd" / f"{split}.jsonl"
         if p.exists():
             print(f"Reading {p} ...")
-            recs = read_bio_jsonl(p, "tokens", "ner_tags", "few_nerd", label_names=fewnerd_labels)
+            recs = read_bio_jsonl_fewnerd(p, "few_nerd", fewnerd_labels)
             print(f"  {len(recs):,} records")
             all_records.extend(recs)
 
-    # ------------------------------------------------------------------
     # 8. CoNLL-2003
-    #    tokens: tokens  |  labels: ner_tags (ClassLabel integers)
-    # ------------------------------------------------------------------
     conll_labels = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG",
                     "B-LOC", "I-LOC", "B-MISC", "I-MISC"]
     for split in ["train", "validation", "test"]:
@@ -513,11 +647,7 @@ def main(data_dir: Path, output_dir: Path):
             print(f"  {len(recs):,} records")
             all_records.extend(recs)
 
-    # ------------------------------------------------------------------
     # 9. nlpaueb/finer-139
-    #    tokens: tokens  |  labels: ner_tags (ClassLabel integers, 279 labels)
-    #    All non-O mapped to FINANCIAL_ENTITY (XBRL tags, not readable as strings)
-    # ------------------------------------------------------------------
     for split in ["train", "validation", "test"]:
         p = data_dir / "finer_139" / f"{split}.jsonl"
         if p.exists():
@@ -526,10 +656,7 @@ def main(data_dir: Path, output_dir: Path):
             print(f"  {len(recs):,} records")
             all_records.extend(recs)
 
-    # ------------------------------------------------------------------
     # 10. Isotonic/pii-masking-200k
-    #     tokens: tokenised_text  |  labels: bio_labels (BIO strings)
-    # ------------------------------------------------------------------
     p = data_dir / "isotonic_pii_200k" / "train.jsonl"
     if p.exists():
         print(f"Reading {p} ...")
@@ -540,7 +667,7 @@ def main(data_dir: Path, output_dir: Path):
         load_errors.append(str(p))
 
     # ------------------------------------------------------------------
-    # Report: unique entities
+    # Entity report
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("UNIQUE ENTITY TYPES PER SOURCE")
@@ -557,7 +684,6 @@ def main(data_dir: Path, output_dir: Path):
     for t in sorted(global_types):
         print(f"  {t}")
 
-    # Save entity report
     entity_report = {
         "global": sorted(global_types),
         "per_source": {src: sorted(types) for src, types in per_source.items()},
@@ -585,7 +711,7 @@ def main(data_dir: Path, output_dir: Path):
             print(f"  {e}")
 
     # ------------------------------------------------------------------
-    # Summary stats
+    # Summary
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("CONSOLIDATION SUMMARY")
@@ -605,6 +731,4 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="./pii_datasets/consolidated",
                         help="Directory to write consolidated output")
     args = parser.parse_args()
-
     main(Path(args.data_dir), Path(args.output_dir))
-
