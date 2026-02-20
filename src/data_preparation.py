@@ -1,266 +1,245 @@
-import requests
-import json
-import os
-from pathlib import Path
-from typing import List, Dict, Tuple
-import pandas as pd
-from datasets import load_dataset
-from sklearn.model_selection import train_test_split
+"""
+Loads the consolidated PII dataset, applies:
+  - finer_139 source cap (150k records)
+  - rare entity type dropping (< 500 B- mentions -> collapsed to O)
+  - stratified 80/10/10 split by source
 
-class PIIDataCollector:
+Outputs:
+  data/train.jsonl
+  data/val.jsonl
+  data/test.jsonl
+  data/label_mapping.json
+"""
+
+import json
+import random
+from collections import Counter, defaultdict
+from pathlib import Path
+
+CONSOLIDATED_FILE = Path("./notebooks/pii_datasets/consolidated/consolidated.jsonl")
+OUTPUT_DIR = Path("./data")
+FINER_CAP = 150_000
+RARE_THRESHOLD = 500
+TRAIN_RATIO = 0.8
+VAL_RATIO = 0.1
+# test gets the remainder (0.1)
+RANDOM_SEED = 42
+
+
+# ---------------------------------------------------------------------------
+# Load
+# ---------------------------------------------------------------------------
+
+def load_consolidated(path: Path) -> list:
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    print(f"Loaded {len(records):,} records from {path}")
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Finer-139 cap
+# ---------------------------------------------------------------------------
+
+def cap_finer(records: list, cap: int, seed: int) -> list:
+    finer = [r for r in records if r["source"] == "finer_139"]
+    rest = [r for r in records if r["source"] != "finer_139"]
+    rng = random.Random(seed)
+    if len(finer) > cap:
+        finer = rng.sample(finer, cap)
+        print(f"finer_139 capped: {len(finer):,} records kept (was {len(records) - len(rest):,})")
+    else:
+        print(f"finer_139 under cap: {len(finer):,} records (no capping needed)")
+    return rest + finer
+
+
+# ---------------------------------------------------------------------------
+# Rare type dropping
+# ---------------------------------------------------------------------------
+
+def drop_rare_entities(records: list, threshold: int) -> tuple:
     """
-    Collects and prepares PII datasets for training.
-    Uses public datasets: CoNLL-2003, WikiANN, and synthetic PII data.
+    Count B- mentions per entity type globally.
+    Any type below threshold has all its B-/I- labels replaced with O.
+    Returns (updated_records, kept_types, dropped_types).
     """
-    
-    def __init__(self, data_dir: str = "./data"):
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        
-        # PII entity labels (BIO format)
-        self.pii_labels = [
-            "O",
-            "B-PERSON",
-            "I-PERSON",
-            "B-EMAIL",
-            "I-EMAIL",
-            "B-PHONE",
-            "I-PHONE",
-            "B-SSN",
-            "I-SSN",
-            "B-CC",
-            "I-CC",
-            "B-ADDRESS",
-            "I-ADDRESS",
-            "B-DATE",
-            "I-DATE",
-            "B-ORG",
-            "I-ORG",
-            "B-LOC",
-            "I-LOC"
-        ]
-        
-    def download_conll2003(self) -> pd.DataFrame:
-        """
-        Download CoNLL-2003 dataset (contains PERSON, ORG, LOC).
-        """
-        print("Downloading CoNLL-2003 dataset...")
-        
-        try:
-            # FIXED: Added trust_remote_code=True for newer datasets library
-            dataset = load_dataset("conll2003", trust_remote_code=True)
-            
-            # Convert to our format
-            data = []
-            for split in ['train', 'validation', 'test']:
-                for example in dataset[split]:
-                    tokens = example['tokens']
-                    ner_tags = example['ner_tags']
-                    
-                    # Convert CoNLL tags to our PII tags
-                    labels = self._convert_conll_tags(ner_tags)
-                    
-                    data.append({
-                        'tokens': tokens,
-                        'labels': labels,
-                        'split': split
-                    })
-            
-            df = pd.DataFrame(data)
-            print(f"CoNLL-2003 loaded: {len(df)} examples")
-            return df
-            
-        except Exception as e:
-            print(f"Error loading CoNLL-2003: {e}")
-            print("Continuing with synthetic data only...")
-            return pd.DataFrame()
-    
-    def _convert_conll_tags(self, ner_tags: List[int]) -> List[str]:
-        """
-        Convert CoNLL-2003 NER tags to our PII label scheme.
-        CoNLL tags: 0=O, 1=B-PER, 2=I-PER, 3=B-ORG, 4=I-ORG, 5=B-LOC, 6=I-LOC, 7=B-MISC, 8=I-MISC
-        """
-        tag_map = {
-            0: "O",
-            1: "B-PERSON",
-            2: "I-PERSON",
-            3: "B-ORG",
-            4: "I-ORG",
-            5: "B-LOC",
-            6: "I-LOC",
-            7: "O",
-            8: "O"
-        }
-        return [tag_map.get(tag, "O") for tag in ner_tags]
-    
-    def generate_synthetic_pii(self, n_samples: int = 5000) -> pd.DataFrame:
-        """
-        Generate synthetic PII examples for email, phone, SSN, credit card, dates.
-        """
-        print(f"Generating {n_samples} synthetic PII examples...")
-        
-        from faker import Faker
-        import random
-        import re
-        
-        fake = Faker()
-        data = []
-        
-        templates = [
-            "My email is {email} and phone is {phone}.",
-            "Contact me at {email} or call {phone}.",
-            "SSN: {ssn}, DOB: {dob}",
-            "Card number {cc} expires on {date}.",
-            "I live at {address}.",
-            "My name is {name} and I work at {org}.",
-            "{name} can be reached at {email} or {phone}.",
-            "Patient: {name}, DOB: {dob}, SSN: {ssn}",
-            "Shipping to {address} for {name}.",
-            "Credit card {cc} belongs to {name}.",
-        ]
-        
-        for _ in range(n_samples):
-            template = random.choice(templates)
-            
-            # Generate PII values
-            pii_values = {
-                'email': fake.email(),
-                'phone': fake.phone_number(),
-                'ssn': fake.ssn(),
-                'cc': fake.credit_card_number(),
-                'dob': fake.date_of_birth().strftime('%m/%d/%Y'),
-                'date': fake.date(),
-                'address': fake.address().replace('\n', ', '),
-                'name': fake.name(),
-                'org': fake.company()
-            }
-            
-            # Fill template
-            text = template
-            entities = []
-            
-            for key, value in pii_values.items():
-                if '{' + key + '}' in text:
-                    start = text.find('{' + key + '}')
-                    text = text.replace('{' + key + '}', value, 1)
-                    
-                    # Map key to label type
-                    label_map = {
-                        'email': 'EMAIL',
-                        'phone': 'PHONE',
-                        'ssn': 'SSN',
-                        'cc': 'CC',
-                        'dob': 'DATE',
-                        'date': 'DATE',
-                        'address': 'ADDRESS',
-                        'name': 'PERSON',
-                        'org': 'ORG'
-                    }
-                    
-                    entities.append({
-                        'start': start,
-                        'end': start + len(value),
-                        'label': label_map[key]
-                    })
-            
-            # Tokenize and create BIO labels
-            tokens, labels = self._tokenize_and_label(text, entities)
-            
-            data.append({
-                'tokens': tokens,
-                'labels': labels,
-                'split': 'train'
+    mention_counts = Counter()
+    for rec in records:
+        for lbl in rec["labels"]:
+            if lbl.startswith("B-"):
+                mention_counts[lbl[2:]] += 1
+
+    dropped_types = {t for t, c in mention_counts.items() if c < threshold}
+    kept_types = {t for t, c in mention_counts.items() if c >= threshold}
+
+    print("\nEntity type mention counts (before dropping):")
+    for etype, count in sorted(mention_counts.items(), key=lambda x: -x[1]):
+        status = "KEEP" if count >= threshold else "DROP"
+        print(f"  [{status}] {etype:<35} {count:>10,}")
+
+    if dropped_types:
+        print(f"\nDropping {len(dropped_types)} rare entity type(s): {sorted(dropped_types)}")
+        updated = []
+        for rec in records:
+            new_labels = []
+            for lbl in rec["labels"]:
+                if lbl == "O":
+                    new_labels.append("O")
+                elif lbl.startswith("B-") or lbl.startswith("I-"):
+                    etype = lbl[2:]
+                    new_labels.append("O" if etype in dropped_types else lbl)
+                else:
+                    new_labels.append("O")
+            updated.append({
+                "tokens": rec["tokens"],
+                "labels": new_labels,
+                "source": rec["source"],
             })
-        
-        df = pd.DataFrame(data)
-        print(f"Generated {len(df)} synthetic examples")
-        return df
-    
-    def _tokenize_and_label(self, text: str, entities: List[Dict]) -> Tuple[List[str], List[str]]:
-        """
-        Tokenize text and assign BIO labels based on entity positions.
-        """
-        # Simple whitespace tokenization
-        tokens = text.split()
-        labels = ["O"] * len(tokens)
-        
-        # Track character positions
-        char_to_token = {}
-        char_pos = 0
-        for token_idx, token in enumerate(tokens):
-            token_start = text.find(token, char_pos)
-            token_end = token_start + len(token)
-            for i in range(token_start, token_end):
-                char_to_token[i] = token_idx
-            char_pos = token_end
-        
-        # Assign labels based on entities
-        for entity in entities:
-            start_token = char_to_token.get(entity['start'])
-            end_token = char_to_token.get(entity['end'] - 1)
-            
-            if start_token is not None and end_token is not None:
-                labels[start_token] = f"B-{entity['label']}"
-                for i in range(start_token + 1, end_token + 1):
-                    labels[i] = f"I-{entity['label']}"
-        
-        return tokens, labels
-    
-    def prepare_dataset(self) -> Dict[str, pd.DataFrame]:
-        """
-        Combine all datasets and split into train/val/test.
-        """
-        print("\n=== Preparing Full Dataset ===")
-        
-        # Collect data from multiple sources
-        conll_df = self.download_conll2003()
-        synthetic_df = self.generate_synthetic_pii(n_samples=5000)
-        
-        # Combine
-        all_data = pd.concat([conll_df, synthetic_df], ignore_index=True)
-        
-        # Split by existing splits or create new ones
-        train_df = all_data[all_data['split'] == 'train'].reset_index(drop=True)
-        val_df = all_data[all_data['split'] == 'validation'].reset_index(drop=True)
-        test_df = all_data[all_data['split'] == 'test'].reset_index(drop=True)
-        
-        # If validation is empty, create from train
-        if len(val_df) == 0:
-            train_df, val_df = train_test_split(train_df, test_size=0.1, random_state=42)
-        
-        # If test is empty, create from train
-        if len(test_df) == 0:
-            train_df, test_df = train_test_split(train_df, test_size=0.1, random_state=42)
-        
-        print(f"\nDataset splits:")
-        print(f"  Train: {len(train_df)}")
-        print(f"  Validation: {len(val_df)}")
-        print(f"  Test: {len(test_df)}")
-        
-        # Save to disk
-        train_df.to_json(self.data_dir / "train.jsonl", orient='records', lines=True)
-        val_df.to_json(self.data_dir / "val.jsonl", orient='records', lines=True)
-        test_df.to_json(self.data_dir / "test.jsonl", orient='records', lines=True)
-        
-        # Save label mapping
-        label2id = {label: idx for idx, label in enumerate(self.pii_labels)}
-        id2label = {idx: label for label, idx in label2id.items()}
-        
-        with open(self.data_dir / "label_mapping.json", 'w') as f:
-            json.dump({
-                'label2id': label2id,
-                'id2label': id2label,
-                'labels': self.pii_labels
-            }, f, indent=2)
-        
-        print(f"\nDatasets saved to {self.data_dir}")
-        
-        return {
-            'train': train_df,
-            'val': val_df,
-            'test': test_df
-        }
+        records = updated
+    else:
+        print("\nNo rare entity types to drop.")
+
+    return records, sorted(kept_types), sorted(dropped_types)
+
+
+# ---------------------------------------------------------------------------
+# Stratified split by source
+# ---------------------------------------------------------------------------
+
+def stratified_split(records: list, train_ratio: float, val_ratio: float,
+                     seed: int) -> tuple:
+    """
+    For each source independently: shuffle, split 80/10/10.
+    Concatenate across sources.
+    """
+    rng = random.Random(seed)
+    by_source = defaultdict(list)
+    for rec in records:
+        by_source[rec["source"]].append(rec)
+
+    train, val, test = [], [], []
+    print("\nStratified split by source:")
+    print(f"  {'Source':<30} {'Total':>8} {'Train':>8} {'Val':>8} {'Test':>8}")
+    print(f"  {'-'*30} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+
+    for source, recs in sorted(by_source.items()):
+        rng.shuffle(recs)
+        n = len(recs)
+        n_train = int(n * train_ratio)
+        n_val = int(n * val_ratio)
+        src_train = recs[:n_train]
+        src_val = recs[n_train:n_train + n_val]
+        src_test = recs[n_train + n_val:]
+        train.extend(src_train)
+        val.extend(src_val)
+        test.extend(src_test)
+        print(f"  {source:<30} {n:>8,} {len(src_train):>8,} {len(src_val):>8,} {len(src_test):>8,}")
+
+    print(f"  {'-'*30} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+    print(f"  {'TOTAL':<30} {len(train)+len(val)+len(test):>8,} {len(train):>8,} {len(val):>8,} {len(test):>8,}")
+
+    # Final shuffle of each split so sources are interleaved during training
+    rng.shuffle(train)
+    rng.shuffle(val)
+    rng.shuffle(test)
+
+    return train, val, test
+
+
+# ---------------------------------------------------------------------------
+# Label mapping
+# ---------------------------------------------------------------------------
+
+def build_label_mapping(kept_types: list) -> tuple:
+    labels = ["O"]
+    for etype in sorted(kept_types):
+        labels.append(f"B-{etype}")
+        labels.append(f"I-{etype}")
+    label2id = {lbl: idx for idx, lbl in enumerate(labels)}
+    id2label = {idx: lbl for lbl, idx in label2id.items()}
+    return labels, label2id, id2label
+
+
+# ---------------------------------------------------------------------------
+# Save
+# ---------------------------------------------------------------------------
+
+def save_split(records: list, path: Path):
+    with open(path, "w") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    size_mb = path.stat().st_size / 1e6
+    print(f"  Saved {len(records):,} records -> {path} ({size_mb:.1f} MB)")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def prepare():
+    random.seed(RANDOM_SEED)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print("PII DATA PREPARATION")
+    print("=" * 60)
+
+    # 1. Load
+    records = load_consolidated(CONSOLIDATED_FILE)
+
+    # 2. Cap finer_139
+    print(f"\nCapping finer_139 to {FINER_CAP:,} records ...")
+    records = cap_finer(records, FINER_CAP, RANDOM_SEED)
+    print(f"Total after cap: {len(records):,}")
+
+    # 3. Drop rare entity types
+    records, kept_types, dropped_types = drop_rare_entities(records, RARE_THRESHOLD)
+
+    # 4. Build label mapping
+    labels, label2id, id2label = build_label_mapping(kept_types)
+    print(f"\nFinal label set ({len(labels)} labels including O):")
+    for lbl in labels:
+        print(f"  {lbl}")
+
+    # 5. Stratified split
+    train, val, test = stratified_split(records, TRAIN_RATIO, VAL_RATIO, RANDOM_SEED)
+
+    # 6. Save splits
+    print("\nSaving splits ...")
+    save_split(train, OUTPUT_DIR / "train.jsonl")
+    save_split(val, OUTPUT_DIR / "val.jsonl")
+    save_split(test, OUTPUT_DIR / "test.jsonl")
+
+    # 7. Save label mapping
+    mapping = {
+        "labels": labels,
+        "label2id": label2id,
+        "id2label": {str(k): v for k, v in id2label.items()},
+        "kept_entity_types": kept_types,
+        "dropped_entity_types": dropped_types,
+        "num_labels": len(labels),
+    }
+    label_path = OUTPUT_DIR / "label_mapping.json"
+    with open(label_path, "w") as f:
+        json.dump(mapping, f, indent=2)
+    print(f"  Label mapping -> {label_path}")
+
+    print("\n" + "=" * 60)
+    print("DATA PREPARATION COMPLETE")
+    print("=" * 60)
+    print(f"  Entity types kept   : {len(kept_types)}")
+    print(f"  Entity types dropped: {len(dropped_types)}")
+    print(f"  Total labels        : {len(labels)}")
+    print(f"  Train records       : {len(train):,}")
+    print(f"  Val records         : {len(val):,}")
+    print(f"  Test records        : {len(test):,}")
+
+    return mapping
+
 
 if __name__ == "__main__":
-    collector = PIIDataCollector(data_dir="./data")
-    datasets = collector.prepare_dataset()
+    prepare()

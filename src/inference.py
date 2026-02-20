@@ -1,328 +1,367 @@
-import torch
+"""
+PII detection inference using a fine-tuned DeBERTa-v3-base model.
+Backward-compatible with src/api.py interface.
+
+Two classes:
+    PIIDetector      — single-text inference with character offsets
+    FastPIIDetector  — batched inference for high-throughput pipelines
+"""
+
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Union
-from transformers import AutoTokenizer, AutoModelForTokenClassification
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+
+
+# ---------------------------------------------------------------------------
+# PIIDetector
+# ---------------------------------------------------------------------------
 
 class PIIDetector:
     """
-    Production PII detector for identifying PII in text.
-    Returns whether PII exists without masking.
+    Loads a fine-tuned DeBERTa-v3-base token classification model.
+
+    detect(text) returns:
+        {
+            "has_pii"   : True,
+            "pii_types" : ["EMAIL", "PERSON", ...],
+            "entities"  : [
+                {
+                    "text"      : "John Smith",
+                    "type"      : "PERSON",
+                    "start"     : 11,       # character offset in original text
+                    "end"       : 21,
+                    "confidence": 0.983,
+                }
+            ],
+            "message"   : "PII detected in input text",
+        }
+        or None if no PII found.
+
+    Character offsets are computed from the tokenizer's offset_mapping so they
+    are exact and suitable for downstream redaction or benchmarking against
+    spaCy / Presidio which also return character spans.
     """
-    
-    def __init__(self, model_path: str, confidence_threshold: float = 0.5):
-        """
-        Initialize PII detector.
-        
-        Args:
-            model_path: Path to fine-tuned model directory
-            confidence_threshold: Minimum confidence for PII detection (0-1)
-        """
-        self.model_path = Path(model_path)
+
+    def __init__(
+        self,
+        model_path: str,
+        confidence_threshold: float = 0.5,
+        device: Optional[str] = None,
+    ):
+        self.model_path           = Path(model_path)
         self.confidence_threshold = confidence_threshold
-        
-        # Load label mappings
-        with open(self.model_path / "label_mapping.json", 'r') as f:
-            label_info = json.load(f)
-        
-        self.label2id = label_info['label2id']
-        self.id2label = {int(k): v for k, v in label_info['id2label'].items()}
-        
-        # Load model and tokenizer
-        print(f"Loading model from {self.model_path}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        self.model = AutoModelForTokenClassification.from_pretrained(self.model_path)
-        
-        # Set device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        with open(self.model_path / "label_mapping.json") as f:
+            mapping = json.load(f)
+        self.label2id = mapping["label2id"]
+        self.id2label = {int(k): v for k, v in mapping["id2label"].items()}
+
+        self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path))
+        self.model     = AutoModelForTokenClassification.from_pretrained(
+            str(self.model_path)
+        )
+
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         self.model.to(self.device)
         self.model.eval()
-        
-        print(f"Model loaded on {self.device}")
-        
-        # PII entity types (excluding 'O')
-        self.pii_types = [label for label in self.id2label.values() if label != "O"]
-    
+
+        # All entity type names (B- prefix stripped)
+        self.pii_types = sorted({
+            lbl[2:] for lbl in self.id2label.values()
+            if lbl.startswith("B-")
+        })
+
+        print(f"PIIDetector loaded: {self.model_path} | device={self.device} | "
+              f"types={len(self.pii_types)} | threshold={self.confidence_threshold}")
+
+    @torch.inference_mode()
     def detect(self, text: str) -> Optional[Dict]:
-        """
-        Detect if PII exists in the input text.
-        
-        Args:
-            text: Input text to check for PII
-            
-        Returns:
-            Dictionary with PII detection results if found, None otherwise
-            Format: {
-                "has_pii": True,
-                "pii_types": ["PERSON", "EMAIL"],
-                "entities": [{"text": "John", "type": "PERSON", "confidence": 0.95}, ...],
-                "message": "PII detected in input text"
-            }
-        """
         if not text or not text.strip():
             return None
-        
-        # Tokenize
-        inputs = self.tokenizer(
+
+        encoding = self.tokenizer(
             text,
             return_tensors="pt",
             truncation=True,
             max_length=512,
-            padding=True
+            padding=False,
+            return_offsets_mapping=True,    # needed for exact character spans
         )
-        
-        # Move to device
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        # Get predictions
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            predictions = torch.softmax(outputs.logits, dim=-1)
-        
-        # Process predictions
-        tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
-        pred_labels = torch.argmax(predictions, dim=-1)[0].cpu().numpy()
-        confidences = torch.max(predictions, dim=-1)[0][0].cpu().numpy()
-        
-        # Extract entities
-        entities = self._extract_entities(tokens, pred_labels, confidences, text)
-        
-        # Check if any PII was detected
-        if entities:
-            pii_types = list(set([e['type'] for e in entities]))
-            
-            return {
-                "has_pii": True,
-                "pii_types": sorted(pii_types),
-                "entities": entities,
-                "message": "PII detected in input text"
-            }
-        
-        return None
-    
+
+        # offset_mapping must be removed before passing to model
+        offset_mapping = encoding.pop("offset_mapping")[0].tolist()
+
+        encoding = {k: v.to(self.device) for k, v in encoding.items()}
+
+        logits      = self.model(**encoding).logits           # [1, seq, num_labels]
+        probs       = torch.softmax(logits, dim=-1)[0]        # [seq, num_labels]
+        pred_ids    = torch.argmax(probs, dim=-1).cpu().numpy()
+        confidences = probs.max(dim=-1).values.cpu().numpy()
+
+        entities = self._extract_entities(
+            text, pred_ids, confidences, offset_mapping
+        )
+
+        if not entities:
+            return None
+
+        return {
+            "has_pii":   True,
+            "pii_types": sorted({e["type"] for e in entities}),
+            "entities":  entities,
+            "message":   "PII detected in input text",
+        }
+
     def _extract_entities(
         self,
-        tokens: List[str],
-        labels: np.ndarray,
+        text: str,
+        pred_ids: np.ndarray,
         confidences: np.ndarray,
-        original_text: str
+        offset_mapping: List[Tuple[int, int]],
     ) -> List[Dict]:
         """
-        Extract entities from token predictions.
+        Reconstructs entities from BIO predictions with character-level offsets.
+        Special tokens have offset (0, 0) and are skipped.
         """
-        entities = []
-        current_entity = None
-        current_tokens = []
-        current_confidences = []
-        
-        for token, label_id, confidence in zip(tokens, labels, confidences):
-            label = self.id2label[label_id]
-            
-            # Skip special tokens and low confidence
-            if token in ['[CLS]', '[SEP]', '<s>', '</s>', '[PAD]']:
+        entities      = []
+        current_type  = None
+        current_start = None
+        current_end   = None
+        current_confs = []
+
+        for pred_id, conf, (char_start, char_end) in zip(
+            pred_ids, confidences, offset_mapping
+        ):
+            # Special tokens ([CLS], [SEP], padding) have zero-length spans
+            if char_start == 0 and char_end == 0:
                 continue
-            
-            if confidence < self.confidence_threshold:
-                continue
-            
-            # Handle BIO tagging
+
+            label = self.id2label.get(int(pred_id), "O")
+
+            # Apply confidence threshold — treat low-confidence predictions as O
+            if float(conf) < self.confidence_threshold:
+                label = "O"
+
             if label.startswith("B-"):
-                # Save previous entity
-                if current_entity:
-                    entity_text = self._reconstruct_text(current_tokens)
-                    avg_confidence = np.mean(current_confidences)
-                    entities.append({
-                        "text": entity_text,
-                        "type": current_entity,
-                        "confidence": float(avg_confidence)
-                    })
-                
-                # Start new entity
-                current_entity = label[2:]  # Remove "B-"
-                current_tokens = [token]
-                current_confidences = [confidence]
-            
-            elif label.startswith("I-") and current_entity == label[2:]:
-                # Continue current entity
-                current_tokens.append(token)
-                current_confidences.append(confidence)
-            
+                # Flush previous entity
+                if current_type is not None:
+                    entities.append(self._make_entity(
+                        text, current_type, current_start, current_end, current_confs
+                    ))
+                current_type  = label[2:]
+                current_start = char_start
+                current_end   = char_end
+                current_confs = [float(conf)]
+
+            elif label.startswith("I-") and current_type == label[2:]:
+                # Extend current entity span
+                current_end = char_end
+                current_confs.append(float(conf))
+
             else:
-                # End current entity
-                if current_entity:
-                    entity_text = self._reconstruct_text(current_tokens)
-                    avg_confidence = np.mean(current_confidences)
-                    entities.append({
-                        "text": entity_text,
-                        "type": current_entity,
-                        "confidence": float(avg_confidence)
-                    })
-                    current_entity = None
-                    current_tokens = []
-                    current_confidences = []
-        
-        # Handle last entity
-        if current_entity:
-            entity_text = self._reconstruct_text(current_tokens)
-            avg_confidence = np.mean(current_confidences)
-            entities.append({
-                "text": entity_text,
-                "type": current_entity,
-                "confidence": float(avg_confidence)
-            })
-        
+                # O or I- without matching B- (broken sequence)
+                if current_type is not None:
+                    entities.append(self._make_entity(
+                        text, current_type, current_start, current_end, current_confs
+                    ))
+                current_type  = None
+                current_start = None
+                current_end   = None
+                current_confs = []
+
+        # Flush final entity
+        if current_type is not None:
+            entities.append(self._make_entity(
+                text, current_type, current_start, current_end, current_confs
+            ))
+
         return entities
-    
-    def _reconstruct_text(self, tokens: List[str]) -> str:
-        """
-        Reconstruct text from subword tokens.
-        """
-        text = ""
-        for token in tokens:
-            if token.startswith("##"):
-                text += token[2:]
-            elif token.startswith("Ġ"):
-                text += " " + token[1:]
-            else:
-                if text:
-                    text += " "
-                text += token
-        
-        return text.strip()
-    
-    def batch_detect(self, texts: List[str]) -> List[Optional[Dict]]:
-        """
-        Detect PII in multiple texts.
-        
-        Args:
-            texts: List of input texts
-            
-        Returns:
-            List of detection results (None if no PII found)
-        """
-        return [self.detect(text) for text in texts]
-    
-    def get_pii_statistics(self, results: List[Optional[Dict]]) -> Dict:
-        """
-        Get statistics from batch detection results.
-        
-        Args:
-            results: List of detection results
-            
-        Returns:
-            Dictionary with statistics
-        """
-        total = len(results)
-        with_pii = sum(1 for r in results if r is not None)
-        
-        # Count PII types
-        pii_type_counts = {}
-        for result in results:
-            if result:
-                for pii_type in result['pii_types']:
-                    pii_type_counts[pii_type] = pii_type_counts.get(pii_type, 0) + 1
-        
+
+    def _make_entity(
+        self,
+        text: str,
+        etype: str,
+        start: int,
+        end: int,
+        confs: List[float],
+    ) -> Dict:
         return {
-            "total_texts": total,
-            "texts_with_pii": with_pii,
-            "texts_without_pii": total - with_pii,
-            "pii_rate": with_pii / total if total > 0 else 0,
-            "pii_type_distribution": pii_type_counts
+            "text":       text[start:end],
+            "type":       etype,
+            "start":      start,
+            "end":        end,
+            "confidence": float(np.mean(confs)),
         }
+
+    def batch_detect(self, texts: List[str]) -> List[Optional[Dict]]:
+        """Sequential single-text inference. Use FastPIIDetector for throughput."""
+        return [self.detect(t) for t in texts]
+
+    def get_pii_statistics(self, results: List[Optional[Dict]]) -> Dict:
+        total    = len(results)
+        with_pii = sum(1 for r in results if r is not None)
+        type_counts: Dict[str, int] = {}
+        for r in results:
+            if r:
+                for t in r["pii_types"]:
+                    type_counts[t] = type_counts.get(t, 0) + 1
+        return {
+            "total_texts":          total,
+            "texts_with_pii":       with_pii,
+            "texts_without_pii":    total - with_pii,
+            "pii_rate":             round(with_pii / total, 4) if total > 0 else 0.0,
+            "pii_type_distribution": dict(
+                sorted(type_counts.items(), key=lambda x: -x[1])
+            ),
+        }
+
+    def redact(self, text: str, replacement: str = "[REDACTED]") -> str:
+        """
+        Returns text with all detected PII spans replaced by `replacement`.
+        Applies replacements in reverse offset order to preserve positions.
+        """
+        result = self.detect(text)
+        if result is None:
+            return text
+
+        entities = sorted(result["entities"], key=lambda e: e["start"], reverse=True)
+        out = text
+        for entity in entities:
+            out = out[:entity["start"]] + replacement + out[entity["end"]:]
+        return out
+
+
+# ---------------------------------------------------------------------------
+# FastPIIDetector — batched inference
+# ---------------------------------------------------------------------------
 
 class FastPIIDetector(PIIDetector):
     """
-    Optimized version for production with batching and caching.
+    Batched inference for high-throughput pipelines.
+    Pads a batch of texts together and runs a single forward pass per batch.
+    Significantly faster than calling detect() in a loop when processing
+    large volumes of text.
     """
-    
-    def __init__(self, model_path: str, confidence_threshold: float = 0.5, batch_size: int = 32):
-        super().__init__(model_path, confidence_threshold)
+
+    def __init__(
+        self,
+        model_path: str,
+        confidence_threshold: float = 0.5,
+        batch_size: int = 32,
+        device: Optional[str] = None,
+    ):
+        super().__init__(model_path, confidence_threshold, device)
         self.batch_size = batch_size
-    
+
     @torch.inference_mode()
     def batch_detect_optimized(self, texts: List[str]) -> List[Optional[Dict]]:
-        """
-        Optimized batch detection with proper batching.
-        """
         if not texts:
             return []
-        
+
         results = []
-        
-        # Process in batches
+
         for i in range(0, len(texts), self.batch_size):
-            batch_texts = texts[i:i + self.batch_size]
-            
-            # Tokenize batch
-            inputs = self.tokenizer(
-                batch_texts,
+            batch = texts[i : i + self.batch_size]
+
+            encoding = self.tokenizer(
+                batch,
                 return_tensors="pt",
                 truncation=True,
                 max_length=512,
-                padding=True
+                padding=True,
+                return_offsets_mapping=True,
             )
-            
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            # Get predictions
-            outputs = self.model(**inputs)
-            predictions = torch.softmax(outputs.logits, dim=-1)
-            
-            # Process each text in batch
-            for idx in range(len(batch_texts)):
-                tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][idx])
-                pred_labels = torch.argmax(predictions[idx], dim=-1).cpu().numpy()
-                confidences = torch.max(predictions[idx], dim=-1)[0].cpu().numpy()
-                
-                entities = self._extract_entities(tokens, pred_labels, confidences, batch_texts[idx])
-                
+
+            # Remove offset_mapping before forward pass
+            offset_mappings = encoding.pop("offset_mapping").tolist()
+
+            encoding = {k: v.to(self.device) for k, v in encoding.items()}
+            logits   = self.model(**encoding).logits        # [B, seq, num_labels]
+            probs    = torch.softmax(logits, dim=-1)        # [B, seq, num_labels]
+
+            for j, (text, offsets) in enumerate(zip(batch, offset_mappings)):
+                pred_ids = torch.argmax(probs[j], dim=-1).cpu().numpy()
+                confs    = probs[j].max(dim=-1).values.cpu().numpy()
+
+                entities = self._extract_entities(
+                    text, pred_ids, confs, offsets
+                )
+
                 if entities:
-                    pii_types = list(set([e['type'] for e in entities]))
                     results.append({
-                        "has_pii": True,
-                        "pii_types": sorted(pii_types),
-                        "entities": entities,
-                        "message": "PII detected in input text"
+                        "has_pii":   True,
+                        "pii_types": sorted({e["type"] for e in entities}),
+                        "entities":  entities,
+                        "message":   "PII detected in input text",
                     })
                 else:
                     results.append(None)
-        
+
         return results
 
-def main():
-    """
-    Example usage.
-    """
-    # Initialize detector
-    detector = PIIDetector(model_path="./models/best_model")
-    
-    # Test cases
-    test_texts = [
-        "My name is John Doe and my email is john.doe@example.com",
-        "Call me at 555-123-4567 or email jane@company.org",
-        "The weather is nice today.",
-        "SSN: 123-45-6789, DOB: 01/15/1990",
-        "Send the package to 123 Main St, New York, NY 10001",
-    ]
-    
-    print("=== PII Detection Results ===\n")
-    
-    for i, text in enumerate(test_texts, 1):
-        result = detector.detect(text)
-        
-        print(f"Text {i}: {text}")
-        
-        if result:
-            print(f"  Status: PII DETECTED")
-            print(f"  Types: {', '.join(result['pii_types'])}")
-            print(f"  Entities:")
-            for entity in result['entities']:
-                print(f"    - {entity['text']} ({entity['type']}, confidence: {entity['confidence']:.2f})")
-        else:
-            print(f"  Status: No PII detected")
-        
-        print()
+    def batch_redact(
+        self,
+        texts: List[str],
+        replacement: str = "[REDACTED]",
+    ) -> List[str]:
+        """Redacts all PII in a list of texts using batched inference."""
+        results = self.batch_detect_optimized(texts)
+        redacted = []
+        for text, result in zip(texts, results):
+            if result is None:
+                redacted.append(text)
+            else:
+                entities = sorted(
+                    result["entities"], key=lambda e: e["start"], reverse=True
+                )
+                out = text
+                for entity in entities:
+                    out = out[:entity["start"]] + replacement + out[entity["end"]:]
+                redacted.append(out)
+        return redacted
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main()
+    detector = PIIDetector(model_path="./models/best_model")
+
+    samples = [
+        "My name is Pritesh Jha and my email is pritesh.jha@example.com",
+        "Call me at +91-98765-43210 or reach John Doe at john.doe@corp.in",
+        "The quarterly revenue increased by 12 percent.",
+        "SSN: 123-45-6789, DOB: 01/15/1990, card ending 4242",
+        "Wire transfer from HDFC account 50100123456789 to JP Morgan Chase",
+    ]
+
+    print("=" * 60)
+    print("PII Detection — smoke test")
+    print("=" * 60)
+
+    for text in samples:
+        result = detector.detect(text)
+        print(f"\nText : {text}")
+        if result:
+            print(f"Types: {result['pii_types']}")
+            for e in result["entities"]:
+                print(f"  [{e['start']}:{e['end']}] {e['text']!r:30s} | "
+                      f"{e['type']:25s} | conf={e['confidence']:.3f}")
+        else:
+            print("  No PII detected")
+
+    print("\n" + "=" * 60)
+    print("Redaction test")
+    print("=" * 60)
+    text = "Contact Sarah Connor at sarah@skynet.com or +1-800-555-0199"
+    print(f"Original : {text}")
+    print(f"Redacted : {detector.redact(text)}")
