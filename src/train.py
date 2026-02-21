@@ -243,7 +243,7 @@ class PIITrainer:
             num_train_epochs=self.num_epochs,
             max_steps=self.max_steps,           # -1 means disabled, epochs take over
             per_device_train_batch_size=self.batch_size,
-            per_device_eval_batch_size=self.batch_size,
+            per_device_eval_batch_size=4,  # was 16, drop to 4 for eval on limited GPU
             gradient_accumulation_steps=self.grad_accum,
 
             # Optimiser
