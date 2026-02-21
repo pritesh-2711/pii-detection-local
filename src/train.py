@@ -45,7 +45,6 @@ MODELS_DIR        = Path("./models")
 LOCAL_MODEL_PATH  = Path("./models/deberta-v3-base")
 HF_MODEL_ID       = "microsoft/deberta-v3-base"
 
-MAX_LENGTH        = 512
 SEED              = 42
 
 
@@ -54,15 +53,16 @@ SEED              = 42
 # ---------------------------------------------------------------------------
 
 class PIIDataset(Dataset):
-    def __init__(self, jsonl_path: Path, tokenizer, label2id: dict):
+    def __init__(self, jsonl_path: Path, tokenizer, label2id: dict, max_length: int):
         self.samples = []
         with open(jsonl_path) as f:
             for line in f:
                 line = line.strip()
                 if line:
                     self.samples.append(json.loads(line))
-        self.tokenizer = tokenizer
-        self.label2id  = label2id
+        self.tokenizer  = tokenizer
+        self.label2id   = label2id
+        self.max_length = max_length
 
     def __len__(self):
         return len(self.samples)
@@ -75,7 +75,7 @@ class PIIDataset(Dataset):
         encoding = self.tokenizer(
             tokens,
             is_split_into_words=True,
-            max_length=MAX_LENGTH,
+            max_length=self.max_length,
             truncation=True,
             padding=False,
         )
@@ -91,7 +91,6 @@ class PIIDataset(Dataset):
                 raw = labels[word_idx] if word_idx < len(labels) else "O"
                 aligned_labels.append(self.label2id.get(raw, self.label2id["O"]))
             else:
-                # Continuation subword — excluded from loss
                 aligned_labels.append(-100)
             prev_word_idx = word_idx
 
@@ -104,18 +103,6 @@ class PIIDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def make_compute_metrics(id2label: dict):
-    """
-    Returns seqeval-based compute_metrics function.
-
-    Reports:
-        f1        — micro-averaged over all entity types (primary benchmark metric)
-        precision — micro-averaged
-        recall    — micro-averaged
-
-    seqeval uses span-level evaluation (not token-level), which is the standard
-    used by CoNLL-2003, OntoNotes, and all major NER benchmarks. This makes
-    results directly comparable to published DeBERTa-v3 NER papers.
-    """
     def compute_metrics(eval_pred):
         logits, label_ids = eval_pred
         predictions = np.argmax(logits, axis=-1)
@@ -150,18 +137,28 @@ class PIITrainer:
         grad_accum: int                  = 4,
         learning_rate: float             = 2e-5,
         num_epochs: int                  = 10,
+        max_steps: int                   = -1,
+        max_length: int                  = 512,
         warmup_ratio: float              = 0.06,
         weight_decay: float              = 0.01,
         early_stopping_patience: int     = 3,
+        eval_steps: int                  = 2000,
+        save_steps: int                  = 2000,
+        logging_steps: int               = 50,
         use_gradient_checkpointing: bool = False,
     ):
         self.batch_size                  = batch_size
         self.grad_accum                  = grad_accum
         self.learning_rate               = learning_rate
         self.num_epochs                  = num_epochs
+        self.max_steps                   = max_steps
+        self.max_length                  = max_length
         self.warmup_ratio                = warmup_ratio
         self.weight_decay                = weight_decay
         self.early_stopping_patience     = early_stopping_patience
+        self.eval_steps                  = eval_steps
+        self.save_steps                  = save_steps
+        self.logging_steps               = logging_steps
         self.use_gradient_checkpointing  = use_gradient_checkpointing
 
         # Label mapping
@@ -185,27 +182,27 @@ class PIITrainer:
             num_labels=self.num_labels,
             id2label=self.id2label,
             label2id=self.label2id,
-            ignore_mismatched_sizes=True,   # base checkpoint has no cls head
+            ignore_mismatched_sizes=True,
         )
 
         if self.use_gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        # DeBERTa-v3 disentangled attention produces gradients that overflow fp16
-        # during GradScaler unscale. bf16 has the same exponent range as fp32
-        # and avoids this. Fall back to fp32 on pre-Ampere GPUs.
         self.device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
         print(f"Device      : {self.device}")
         print(f"Precision   : {'bf16' if self.use_bf16 else 'fp32'}")
         print(f"Grad ckpt   : {'enabled' if self.use_gradient_checkpointing else 'disabled'}")
+        print(f"Max length  : {self.max_length}")
+        if self.max_steps > 0:
+            print(f"Max steps   : {self.max_steps} (overrides epochs)")
 
     def load_datasets(self):
         print("\nLoading datasets ...")
-        self.train_ds = PIIDataset(DATA_DIR / "train.jsonl", self.tokenizer, self.label2id)
-        self.val_ds   = PIIDataset(DATA_DIR / "val.jsonl",   self.tokenizer, self.label2id)
-        self.test_ds  = PIIDataset(DATA_DIR / "test.jsonl",  self.tokenizer, self.label2id)
+        self.train_ds = PIIDataset(DATA_DIR / "train.jsonl", self.tokenizer, self.label2id, self.max_length)
+        self.val_ds   = PIIDataset(DATA_DIR / "val.jsonl",   self.tokenizer, self.label2id, self.max_length)
+        self.test_ds  = PIIDataset(DATA_DIR / "test.jsonl",  self.tokenizer, self.label2id, self.max_length)
         print(f"  Train : {len(self.train_ds):,}")
         print(f"  Val   : {len(self.val_ds):,}")
         print(f"  Test  : {len(self.test_ds):,}")
@@ -216,17 +213,24 @@ class PIITrainer:
 
         effective_batch  = self.batch_size * self.grad_accum
         steps_per_epoch  = max(1, len(self.train_ds) // effective_batch)
-        total_steps      = steps_per_epoch * self.num_epochs
-        warmup_steps     = int(total_steps * self.warmup_ratio)
+
+        # When max_steps is set, use it for warmup calculation.
+        # Otherwise use total epoch-based steps.
+        if self.max_steps > 0:
+            total_steps_for_warmup = self.max_steps
+        else:
+            total_steps_for_warmup = steps_per_epoch * self.num_epochs
+        warmup_steps = int(total_steps_for_warmup * self.warmup_ratio)
 
         print(f"\n  Effective batch size  : {effective_batch}")
         print(f"  Steps per epoch       : {steps_per_epoch:,}")
-        print(f"  Total optimizer steps : {total_steps:,}")
+        print(f"  Total optimizer steps : {total_steps_for_warmup:,}")
         print(f"  Warmup steps          : {warmup_steps:,}")
         print(f"  Early stop patience   : {self.early_stopping_patience} epochs")
+        print(f"  Eval every            : {self.eval_steps} steps")
+        print(f"  Save every            : {self.save_steps} steps")
+        print(f"  Log every             : {self.logging_steps} steps")
 
-        # dataloader tuning: pin_memory + more workers benefit cloud NVMe setups
-        # disable on local machines where GPU memory is the bottleneck
         on_cloud    = not self.use_gradient_checkpointing
         pin_memory  = on_cloud
         num_workers = 4 if on_cloud else 2
@@ -237,32 +241,35 @@ class PIITrainer:
 
             # Core training
             num_train_epochs=self.num_epochs,
+            max_steps=self.max_steps,           # -1 means disabled, epochs take over
             per_device_train_batch_size=self.batch_size,
             per_device_eval_batch_size=self.batch_size,
             gradient_accumulation_steps=self.grad_accum,
 
-            # Optimiser — AdamW with linear LR decay to zero
+            # Optimiser
             learning_rate=self.learning_rate,
             weight_decay=self.weight_decay,
             warmup_steps=warmup_steps,
-            lr_scheduler_type="linear",     # standard for NER fine-tuning
-            max_grad_norm=1.0,              # gradient clipping, DeBERTa default
+            lr_scheduler_type="linear",
+            max_grad_norm=1.0,
 
             # Precision
             fp16=False,
             bf16=self.use_bf16,
 
-            # Evaluation & checkpointing
-            eval_strategy="epoch",
-            save_strategy="epoch",
+            # Evaluation & checkpointing — steps-based
+            eval_strategy="steps",
+            save_strategy="steps",
+            eval_steps=self.eval_steps,
+            save_steps=self.save_steps,
             load_best_model_at_end=True,
             metric_for_best_model="eval_f1",
             greater_is_better=True,
-            save_total_limit=3,             # keep best + 2 most recent
+            save_total_limit=3,
 
             # Logging
             logging_strategy="steps",
-            logging_steps=500,
+            logging_steps=self.logging_steps,
             report_to="none",
 
             # Dataloader
@@ -276,7 +283,7 @@ class PIITrainer:
         collator = DataCollatorForTokenClassification(
             tokenizer=self.tokenizer,
             padding=True,
-            max_length=MAX_LENGTH,
+            max_length=self.max_length,
         )
 
         trainer = Trainer(
@@ -299,7 +306,6 @@ class PIITrainer:
         print("=" * 60)
         trainer.train()
 
-        # Persist best model + tokenizer + label mapping together
         best_model_dir = MODELS_DIR / "best_model"
         print(f"\nSaving best model to {best_model_dir} ...")
         trainer.save_model(str(best_model_dir))
@@ -362,18 +368,24 @@ class PIITrainer:
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune DeBERTa-v3-base for PII NER")
 
-    parser.add_argument("--batch-size",             type=int,   default=16,
-                        help="Per-device train batch size (default: 16 for A100)")
-    parser.add_argument("--grad-accum",             type=int,   default=4,
-                        help="Gradient accumulation steps (effective batch = batch * accum)")
-    parser.add_argument("--epochs",                 type=int,   default=10)
-    parser.add_argument("--lr",                     type=float, default=2e-5)
-    parser.add_argument("--warmup-ratio",           type=float, default=0.06)
-    parser.add_argument("--weight-decay",           type=float, default=0.01)
-    parser.add_argument("--early-stopping-patience",type=int,   default=3,
-                        help="Stop if val F1 does not improve for N epochs")
-    parser.add_argument("--gradient-checkpointing", action="store_true",
-                        help="Enable gradient checkpointing (required on <=8GB VRAM)")
+    parser.add_argument("--batch-size",              type=int,   default=16)
+    parser.add_argument("--grad-accum",              type=int,   default=4)
+    parser.add_argument("--epochs",                  type=int,   default=10)
+    parser.add_argument("--max-steps",               type=int,   default=-1,
+                        help="Hard step limit. Overrides --epochs when > 0.")
+    parser.add_argument("--max-length",              type=int,   default=512,
+                        help="Token sequence length (default: 512)")
+    parser.add_argument("--lr",                      type=float, default=2e-5)
+    parser.add_argument("--warmup-ratio",            type=float, default=0.06)
+    parser.add_argument("--weight-decay",            type=float, default=0.01)
+    parser.add_argument("--early-stopping-patience", type=int,   default=3)
+    parser.add_argument("--eval-steps",              type=int,   default=2000,
+                        help="Evaluate every N steps (default: 2000)")
+    parser.add_argument("--save-steps",              type=int,   default=2000,
+                        help="Save checkpoint every N steps (default: 2000)")
+    parser.add_argument("--logging-steps",           type=int,   default=50,
+                        help="Log loss/lr every N steps (default: 50)")
+    parser.add_argument("--gradient-checkpointing",  action="store_true")
 
     args = parser.parse_args()
 
@@ -382,9 +394,14 @@ def main():
         grad_accum=args.grad_accum,
         learning_rate=args.lr,
         num_epochs=args.epochs,
+        max_steps=args.max_steps,
+        max_length=args.max_length,
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         early_stopping_patience=args.early_stopping_patience,
+        eval_steps=args.eval_steps,
+        save_steps=args.save_steps,
+        logging_steps=args.logging_steps,
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
     pii_trainer.load_datasets()

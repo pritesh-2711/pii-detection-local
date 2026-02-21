@@ -13,11 +13,14 @@ Usage:
 
     # Custom training hyperparameters:
     python run_training_pipeline.py \
-        --batch-size 2 \
-        --grad-accum 32 \
+        --batch-size 16 \
+        --grad-accum 4 \
+        --max-length 256 \
         --epochs 10 \
-        --lr 2e-5 \
-        --gradient-checkpointing
+        --max-steps 40000 \
+        --eval-steps 2000 \
+        --save-steps 2000 \
+        --logging-steps 50
 
     # Full options:
     python run_training_pipeline.py --help
@@ -39,9 +42,14 @@ def run_pipeline(
     grad_accum: int = 4,
     learning_rate: float = 2e-5,
     num_epochs: int = 10,
+    max_steps: int = -1,
+    max_length: int = 512,
     warmup_ratio: float = 0.06,
     weight_decay: float = 0.01,
     early_stopping_patience: int = 3,
+    eval_steps: int = 2000,
+    save_steps: int = 2000,
+    logging_steps: int = 50,
     use_gradient_checkpointing: bool = False,
 ):
     print("=" * 80)
@@ -71,9 +79,14 @@ def run_pipeline(
         grad_accum=grad_accum,
         learning_rate=learning_rate,
         num_epochs=num_epochs,
+        max_steps=max_steps,
+        max_length=max_length,
         warmup_ratio=warmup_ratio,
         weight_decay=weight_decay,
         early_stopping_patience=early_stopping_patience,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
+        logging_steps=logging_steps,
         use_gradient_checkpointing=use_gradient_checkpointing,
     )
     trainer.load_datasets()
@@ -103,47 +116,42 @@ def main():
         action="store_true",
         help="Skip base model download and use existing weights in ./models/deberta-v3-base",
     )
+    parser.add_argument("--batch-size",              type=int,   default=16)
+    parser.add_argument("--grad-accum",              type=int,   default=4)
+    parser.add_argument("--epochs",                  type=int,   default=10)
     parser.add_argument(
-        "--batch-size",
+        "--max-steps",
         type=int,
-        default=16,
-        help="Per-device train batch size (default: 16)",
+        default=-1,
+        help="Hard step limit. Overrides --epochs when > 0. Use to cap a long run.",
     )
     parser.add_argument(
-        "--grad-accum",
+        "--max-length",
         type=int,
-        default=4,
-        help="Gradient accumulation steps (default: 4)",
+        default=512,
+        help="Token sequence length (default: 512, use 256 to halve memory/time)",
     )
+    parser.add_argument("--lr",                      type=float, default=2e-5)
+    parser.add_argument("--warmup-ratio",            type=float, default=0.06)
+    parser.add_argument("--weight-decay",            type=float, default=0.01)
+    parser.add_argument("--early-stopping-patience", type=int,   default=3)
     parser.add_argument(
-        "--epochs",
+        "--eval-steps",
         type=int,
-        default=10,
-        help="Number of training epochs (default: 10)",
+        default=2000,
+        help="Evaluate on val set every N steps (default: 2000)",
     )
     parser.add_argument(
-        "--lr",
-        type=float,
-        default=2e-5,
-        help="Learning rate (default: 2e-5)",
-    )
-    parser.add_argument(
-        "--warmup-ratio",
-        type=float,
-        default=0.06,
-        help="Warmup ratio as fraction of total steps (default: 0.06)",
-    )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=0.01,
-        help="Weight decay (default: 0.01)",
-    )
-    parser.add_argument(
-        "--early-stopping-patience",
+        "--save-steps",
         type=int,
-        default=3,
-        help="Stop if val F1 does not improve for N epochs (default: 3)",
+        default=2000,
+        help="Save checkpoint every N steps (default: 2000)",
+    )
+    parser.add_argument(
+        "--logging-steps",
+        type=int,
+        default=50,
+        help="Log loss/lr every N steps (default: 50)",
     )
     parser.add_argument(
         "--gradient-checkpointing",
@@ -159,9 +167,14 @@ def main():
         grad_accum=args.grad_accum,
         learning_rate=args.lr,
         num_epochs=args.epochs,
+        max_steps=args.max_steps,
+        max_length=args.max_length,
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         early_stopping_patience=args.early_stopping_patience,
+        eval_steps=args.eval_steps,
+        save_steps=args.save_steps,
+        logging_steps=args.logging_steps,
         use_gradient_checkpointing=args.gradient_checkpointing,
     )
 
