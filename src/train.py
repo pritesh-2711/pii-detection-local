@@ -134,6 +134,7 @@ class PIITrainer:
     def __init__(
         self,
         batch_size: int                  = 16,
+        eval_batch_size: int             = 32,
         grad_accum: int                  = 4,
         learning_rate: float             = 2e-5,
         num_epochs: int                  = 10,
@@ -146,8 +147,10 @@ class PIITrainer:
         save_steps: int                  = 2000,
         logging_steps: int               = 50,
         use_gradient_checkpointing: bool = False,
+        resume_from_checkpoint: bool     = False,
     ):
         self.batch_size                  = batch_size
+        self.eval_batch_size             = eval_batch_size
         self.grad_accum                  = grad_accum
         self.learning_rate               = learning_rate
         self.num_epochs                  = num_epochs
@@ -160,6 +163,7 @@ class PIITrainer:
         self.save_steps                  = save_steps
         self.logging_steps               = logging_steps
         self.use_gradient_checkpointing  = use_gradient_checkpointing
+        self.resume_from_checkpoint      = resume_from_checkpoint
 
         # Label mapping
         with open(DATA_DIR / "label_mapping.json") as f:
@@ -233,7 +237,7 @@ class PIITrainer:
 
         on_cloud    = not self.use_gradient_checkpointing
         pin_memory  = on_cloud
-        num_workers = 4 if on_cloud else 2
+        num_workers = 2  # 4 causes CPU contention on g2-standard-8
 
         args = TrainingArguments(
             output_dir=str(output_dir),
@@ -241,9 +245,9 @@ class PIITrainer:
 
             # Core training
             num_train_epochs=self.num_epochs,
-            max_steps=self.max_steps,           # -1 means disabled, epochs take over
+            max_steps=self.max_steps,
             per_device_train_batch_size=self.batch_size,
-            per_device_eval_batch_size=4,  # was 16, drop to 4 for eval on limited GPU
+            per_device_eval_batch_size=self.eval_batch_size,
             gradient_accumulation_steps=self.grad_accum,
 
             # Optimiser
@@ -304,7 +308,22 @@ class PIITrainer:
         print("\n" + "=" * 60)
         print("TRAINING")
         print("=" * 60)
-        trainer.train()
+
+        checkpoint = None
+        if self.resume_from_checkpoint:
+            checkpoints_dir = MODELS_DIR / "checkpoints"
+            if checkpoints_dir.exists():
+                ckpts = sorted(checkpoints_dir.glob("checkpoint-*"),
+                               key=lambda p: int(p.name.split("-")[-1]))
+                if ckpts:
+                    checkpoint = str(ckpts[-1])
+                    print(f"Resuming from checkpoint: {checkpoint}")
+                else:
+                    print("No checkpoint found, starting from scratch.")
+            else:
+                print("No checkpoints directory found, starting from scratch.")
+
+        trainer.train(resume_from_checkpoint=checkpoint)
 
         best_model_dir = MODELS_DIR / "best_model"
         print(f"\nSaving best model to {best_model_dir} ...")
@@ -325,7 +344,7 @@ class PIITrainer:
         print("EVALUATION ON TEST SET")
         print("=" * 60)
 
-        preds_output = trainer.predict(self.test_ds)
+        preds_output = trainer.predict(self.test_ds, metric_key_prefix="test")
         logits       = preds_output.predictions
         label_ids    = preds_output.label_ids
         predictions  = np.argmax(logits, axis=-1)
@@ -369,6 +388,8 @@ def main():
     parser = argparse.ArgumentParser(description="Fine-tune DeBERTa-v3-base for PII NER")
 
     parser.add_argument("--batch-size",              type=int,   default=16)
+    parser.add_argument("--eval-batch-size",          type=int,   default=32,
+                        help="Eval/predict batch size (default: 32). Lower if eval OOMs.")
     parser.add_argument("--grad-accum",              type=int,   default=4)
     parser.add_argument("--epochs",                  type=int,   default=10)
     parser.add_argument("--max-steps",               type=int,   default=-1,
@@ -386,11 +407,14 @@ def main():
     parser.add_argument("--logging-steps",           type=int,   default=50,
                         help="Log loss/lr every N steps (default: 50)")
     parser.add_argument("--gradient-checkpointing",  action="store_true")
+    parser.add_argument("--resume-from-checkpoint",  action="store_true",
+                        help="Resume from latest checkpoint in models/checkpoints/")
 
     args = parser.parse_args()
 
     pii_trainer = PIITrainer(
         batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
         grad_accum=args.grad_accum,
         learning_rate=args.lr,
         num_epochs=args.epochs,
@@ -403,6 +427,7 @@ def main():
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         use_gradient_checkpointing=args.gradient_checkpointing,
+        resume_from_checkpoint=args.resume_from_checkpoint,
     )
     pii_trainer.load_datasets()
     trainer = pii_trainer.train()

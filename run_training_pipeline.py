@@ -39,6 +39,7 @@ from train import PIITrainer
 def run_pipeline(
     skip_download: bool = False,
     batch_size: int = 16,
+    eval_batch_size: int = 32,
     grad_accum: int = 4,
     learning_rate: float = 2e-5,
     num_epochs: int = 10,
@@ -51,6 +52,7 @@ def run_pipeline(
     save_steps: int = 2000,
     logging_steps: int = 50,
     use_gradient_checkpointing: bool = False,
+    resume_from_checkpoint: bool = False,
 ):
     print("=" * 80)
     print("PII DETECTION — TRAINING PIPELINE")
@@ -76,6 +78,7 @@ def run_pipeline(
 
     trainer = PIITrainer(
         batch_size=batch_size,
+        eval_batch_size=eval_batch_size,
         grad_accum=grad_accum,
         learning_rate=learning_rate,
         num_epochs=num_epochs,
@@ -88,6 +91,7 @@ def run_pipeline(
         save_steps=save_steps,
         logging_steps=logging_steps,
         use_gradient_checkpointing=use_gradient_checkpointing,
+        resume_from_checkpoint=resume_from_checkpoint,
     )
     trainer.load_datasets()
     hf_trainer = trainer.train()
@@ -117,6 +121,8 @@ def main():
         help="Skip base model download and use existing weights in ./models/deberta-v3-base",
     )
     parser.add_argument("--batch-size",              type=int,   default=16)
+    parser.add_argument("--eval-batch-size",          type=int,   default=32,
+                        help="Eval/predict batch size (default: 32). Lower if eval OOMs.")
     parser.add_argument("--grad-accum",              type=int,   default=4)
     parser.add_argument("--epochs",                  type=int,   default=10)
     parser.add_argument(
@@ -135,28 +141,14 @@ def main():
     parser.add_argument("--warmup-ratio",            type=float, default=0.06)
     parser.add_argument("--weight-decay",            type=float, default=0.01)
     parser.add_argument("--early-stopping-patience", type=int,   default=3)
+    parser.add_argument("--eval-steps",              type=int,   default=2000)
+    parser.add_argument("--save-steps",              type=int,   default=2000)
+    parser.add_argument("--logging-steps",           type=int,   default=50)
+    parser.add_argument("--gradient-checkpointing",  action="store_true")
     parser.add_argument(
-        "--eval-steps",
-        type=int,
-        default=2000,
-        help="Evaluate on val set every N steps (default: 2000)",
-    )
-    parser.add_argument(
-        "--save-steps",
-        type=int,
-        default=2000,
-        help="Save checkpoint every N steps (default: 2000)",
-    )
-    parser.add_argument(
-        "--logging-steps",
-        type=int,
-        default=50,
-        help="Log loss/lr every N steps (default: 50)",
-    )
-    parser.add_argument(
-        "--gradient-checkpointing",
+        "--resume-from-checkpoint",
         action="store_true",
-        help="Enable gradient checkpointing — required on <=8GB VRAM",
+        help="Resume from latest checkpoint in models/checkpoints/",
     )
 
     args = parser.parse_args()
@@ -164,6 +156,7 @@ def main():
     run_pipeline(
         skip_download=args.skip_download,
         batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
         grad_accum=args.grad_accum,
         learning_rate=args.lr,
         num_epochs=args.epochs,
@@ -176,6 +169,7 @@ def main():
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         use_gradient_checkpointing=args.gradient_checkpointing,
+        resume_from_checkpoint=args.resume_from_checkpoint,
     )
 
 
