@@ -258,7 +258,7 @@ class PIITrainer:
             max_grad_norm=1.0,
 
             # Precision
-            fp16=False,
+            fp16=True,  # Use mixed precision (fp16 or bf16) if supported
             bf16=self.use_bf16,
 
             # Evaluation & checkpointing — steps-based
