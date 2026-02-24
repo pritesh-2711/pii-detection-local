@@ -12,6 +12,15 @@ Pre-tokenize once (recommended for repeated runs):
     python src/train.py --pretokenize-only
     python src/train.py --use-pretokenized
 
+Notes on torch_compile
+-----------------------
+torch.compile is NOT enabled by default and is generally not worth it here:
+  - Token classification batches have variable sequence lengths (different
+    padding per batch), which triggers shape respecialisation on every new
+    shape. On V100 / older CUDA the recompilation overhead exceeds the gain.
+  - Use --torch-compile only if you have A100/H100 + CUDA >= 11.8 + PyTorch
+    >= 2.1 and are running long enough that amortised compile cost pays off.
+    Even then, benefit is marginal vs. bf16 + gradient checkpointing.
 """
 
 import json
@@ -313,6 +322,8 @@ class PIITrainer:
         torch_compile: bool              = False,
         use_pretokenized: bool           = False,
         pretokenized_dir: Path           = PRETOKENIZED_DIR,
+        eval_accumulation_steps: int     = 1,
+        prediction_loss_only: bool       = False,
     ):
         self.batch_size                  = batch_size
         self.eval_batch_size             = eval_batch_size
@@ -333,6 +344,8 @@ class PIITrainer:
         self.torch_compile               = torch_compile
         self.use_pretokenized            = use_pretokenized
         self.pretokenized_dir            = pretokenized_dir
+        self.eval_accumulation_steps     = eval_accumulation_steps
+        self.prediction_loss_only        = prediction_loss_only
 
         # Label mapping
         with open(DATA_DIR / "label_mapping.json") as f:
@@ -374,6 +387,8 @@ class PIITrainer:
         print(f"Precision        : {'bf16' if self.use_bf16 else 'fp32'}")
         print(f"fp16_full_eval   : {self.fp16_full_eval}")
         print(f"torch_compile    : {self.torch_compile}")
+        print(f"eval_accum_steps : {self.eval_accumulation_steps}")
+        print(f"pred_loss_only   : {self.prediction_loss_only}")
         print(f"Grad ckpt        : {'enabled' if self.use_gradient_checkpointing else 'disabled'}")
         print(f"Max length       : {self.max_length}")
         print(f"Dataset mode     : {'pre-tokenized Arrow' if self.use_pretokenized else 'streaming JSONL'}")
@@ -513,6 +528,19 @@ class PIITrainer:
             metric_for_best_model="eval_f1",
             greater_is_better=True,
             save_total_limit=3,
+            # Prevents OOM during eval by flushing accumulated logits/predictions
+            # to CPU every N batches instead of holding the entire eval set in
+            # memory. With 139k val records x 512 tokens x 97 labels x 4 bytes
+            # = ~27GB if accumulated all at once. Set to 1 to flush every batch.
+            # Increase to 2 or 4 if CPU->GPU transfer overhead becomes noticeable
+            # (unlikely on this workload).
+            eval_accumulation_steps=self.eval_accumulation_steps,
+            # Set prediction_loss_only=True only for sanity-check runs where you
+            # want loss curves without the overhead of logit accumulation and
+            # seqeval metric computation. Disables compute_metrics entirely.
+            # Keep False for normal training so eval_f1 is available for
+            # load_best_model_at_end and early stopping.
+            prediction_loss_only=self.prediction_loss_only,
 
             # Logging
             logging_strategy="steps",
@@ -682,6 +710,25 @@ def main():
         ),
     )
     parser.add_argument(
+        "--eval-accumulation-steps",
+        type=int,
+        default=1,
+        help=(
+            "Flush accumulated logits/predictions to CPU every N eval batches. "
+            "Default 1 prevents OOM from holding all 139k val logits in memory. "
+            "Increase to 2-4 only if you see CPU<->GPU transfer stalls."
+        ),
+    )
+    parser.add_argument(
+        "--prediction-loss-only",
+        action="store_true",
+        help=(
+            "Skip logit accumulation and metric computation during eval. "
+            "Use for quick sanity-check runs to see loss curves only. "
+            "Disables eval_f1 and therefore load_best_model_at_end."
+        ),
+    )
+    parser.add_argument(
         "--pretokenize-only",
         action="store_true",
         help="Tokenize all splits to Arrow format and exit. Run once before training.",
@@ -729,6 +776,8 @@ def main():
         torch_compile=args.torch_compile,
         use_pretokenized=args.use_pretokenized,
         pretokenized_dir=Path(args.pretokenized_dir),
+        eval_accumulation_steps=args.eval_accumulation_steps,
+        prediction_loss_only=args.prediction_loss_only,
     )
 
     if args.pretokenize_only:

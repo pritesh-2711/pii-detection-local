@@ -11,13 +11,19 @@ Usage:
     # Skip model download if already done:
     python run_training_pipeline.py --skip-download
 
+    # Fix eval OOM (most common first run issue):
+    python run_training_pipeline.py --eval-accumulation-steps 1
+
+    # Pre-tokenize once then reuse across runs:
+    python run_training_pipeline.py --pretokenize-only
+    python run_training_pipeline.py --use-pretokenized
+
     # Custom training hyperparameters:
     python run_training_pipeline.py \
         --batch-size 16 \
         --grad-accum 4 \
-        --max-length 256 \
+        --max-length 512 \
         --epochs 10 \
-        --max-steps 40000 \
         --eval-steps 2000 \
         --save-steps 2000 \
         --logging-steps 50
@@ -33,7 +39,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent / "src"))
 
 from download_model import main as download_model
-from train import PIITrainer
+from train import PIITrainer, PRETOKENIZED_DIR
 
 
 def run_pipeline(
@@ -53,6 +59,14 @@ def run_pipeline(
     logging_steps: int = 50,
     use_gradient_checkpointing: bool = False,
     resume_from_checkpoint: bool = False,
+    fp16_full_eval: bool = False,
+    torch_compile: bool = False,
+    eval_accumulation_steps: int = 1,
+    prediction_loss_only: bool = False,
+    pretokenize_only: bool = False,
+    use_pretokenized: bool = False,
+    pretokenized_dir: Path = PRETOKENIZED_DIR,
+    pretokenize_num_proc: int = 4,
 ):
     print("=" * 80)
     print("PII DETECTION — TRAINING PIPELINE")
@@ -92,7 +106,19 @@ def run_pipeline(
         logging_steps=logging_steps,
         use_gradient_checkpointing=use_gradient_checkpointing,
         resume_from_checkpoint=resume_from_checkpoint,
+        fp16_full_eval=fp16_full_eval,
+        torch_compile=torch_compile,
+        eval_accumulation_steps=eval_accumulation_steps,
+        prediction_loss_only=prediction_loss_only,
+        use_pretokenized=use_pretokenized,
+        pretokenized_dir=pretokenized_dir,
     )
+
+    if pretokenize_only:
+        trainer.pretokenize(num_proc=pretokenize_num_proc)
+        print("\nPre-tokenization complete. Re-run without --pretokenize-only to train.")
+        return {}
+
     trainer.load_datasets()
     hf_trainer = trainer.train()
     results = trainer.evaluate(hf_trainer)
@@ -109,6 +135,8 @@ def run_pipeline(
     print(f"  Test Precision    : {results.get('test_precision', 0):.4f}")
     print(f"  Test Recall       : {results.get('test_recall', 0):.4f}")
     print("\nNext step: python src/api.py --model-path ./models/best_model")
+
+    return results
 
 
 def main():
@@ -129,7 +157,7 @@ def main():
         "--max-steps",
         type=int,
         default=-1,
-        help="Hard step limit. Overrides --epochs when > 0. Use to cap a long run.",
+        help="Hard step limit. Overrides --epochs when > 0.",
     )
     parser.add_argument(
         "--max-length",
@@ -149,6 +177,61 @@ def main():
         "--resume-from-checkpoint",
         action="store_true",
         help="Resume from latest checkpoint in models/checkpoints/",
+    )
+    parser.add_argument(
+        "--fp16-full-eval",
+        action="store_true",
+        help=(
+            "Run evaluation in fp16. Halves eval VRAM. Use only if eval OOMs "
+            "after lowering --eval-batch-size. Try --eval-accumulation-steps first."
+        ),
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help=(
+            "Enable torch.compile. Only beneficial on A100/H100 + CUDA >= 11.8 "
+            "+ PyTorch >= 2.1. Not recommended on V100/T4."
+        ),
+    )
+    parser.add_argument(
+        "--eval-accumulation-steps",
+        type=int,
+        default=1,
+        help=(
+            "Flush eval logits to CPU every N batches to prevent OOM. "
+            "Default 1 is safest. Increase to 2-4 if transfer overhead is visible."
+        ),
+    )
+    parser.add_argument(
+        "--prediction-loss-only",
+        action="store_true",
+        help=(
+            "Skip logit accumulation and metric computation during eval. "
+            "Use for quick loss-curve sanity checks only. Disables eval_f1."
+        ),
+    )
+    parser.add_argument(
+        "--pretokenize-only",
+        action="store_true",
+        help="Tokenize all splits to Arrow format and exit. Run once before training.",
+    )
+    parser.add_argument(
+        "--use-pretokenized",
+        action="store_true",
+        help="Load Arrow datasets instead of streaming JSONL. Requires --pretokenize-only first.",
+    )
+    parser.add_argument(
+        "--pretokenize-num-proc",
+        type=int,
+        default=4,
+        help="Parallel processes for pre-tokenization (default: 4).",
+    )
+    parser.add_argument(
+        "--pretokenized-dir",
+        type=str,
+        default=str(PRETOKENIZED_DIR),
+        help=f"Directory for Arrow datasets (default: {PRETOKENIZED_DIR}).",
     )
 
     args = parser.parse_args()
@@ -170,6 +253,14 @@ def main():
         logging_steps=args.logging_steps,
         use_gradient_checkpointing=args.gradient_checkpointing,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        fp16_full_eval=args.fp16_full_eval,
+        torch_compile=args.torch_compile,
+        eval_accumulation_steps=args.eval_accumulation_steps,
+        prediction_loss_only=args.prediction_loss_only,
+        pretokenize_only=args.pretokenize_only,
+        use_pretokenized=args.use_pretokenized,
+        pretokenized_dir=Path(args.pretokenized_dir),
+        pretokenize_num_proc=args.pretokenize_num_proc,
     )
 
 
