@@ -1,195 +1,223 @@
 # PII Detection System
 
-Production-ready PII detection system using fine-tuned transformer models.
+Production-ready PII detection system using a fine-tuned DeBERTa-v3-base token classification model.
 
 ## Project Structure
 
 ```
 pii-detector/
-├── data/                      # Training datasets
+├── data/                          # Train/val/test splits + label mapping
 │   ├── train.jsonl
 │   ├── val.jsonl
 │   ├── test.jsonl
 │   └── label_mapping.json
-├── models/                    # Trained models
-│   └── best_model/
+├── models/
+│   ├── deberta-v3-base/           # Downloaded base model weights
+│   ├── checkpoints/               # Training checkpoints
+│   └── best_model/                # Final fine-tuned model
+├── pii_datasets/                  # Raw downloaded datasets
+│   └── consolidated/
+│       ├── consolidated.jsonl
+│       └── entity_types.json
 ├── src/
-│   ├── data_preparation.py   # Data collection and preprocessing
-│   ├── train.py              # Model training
-│   ├── inference.py          # Prediction/inference
-│   └── api.py                # REST API server
-├── run_pipeline.py           # End-to-end pipeline
-├── test_detector.py          # Test suite
-├── requirements.txt          # Python dependencies
-├── requirements-api.txt      # API dependencies
-└── Dockerfile                # Docker deployment
+│   ├── download_datasets.py       # Downloads 10 datasets from HuggingFace
+│   ├── consolidate_pii_datasets.py # Normalises all sources into BIO format
+│   ├── data_preparation.py        # Splits, rare-entity dropping, label mapping
+│   ├── download_model.py          # Downloads microsoft/deberta-v3-base
+│   ├── train.py                   # Fine-tuning with HuggingFace Trainer
+│   ├── inference.py               # PIIDetector and FastPIIDetector classes
+│   ├── api.py                     # Flask REST API
+│   └── exceptions.py              # Custom exception hierarchy
+├── run_data_pipeline.py           # Orchestrates steps 1-3 of data prep
+├── run_training_pipeline.py       # Orchestrates model download + fine-tuning
+├── run_benchmarking.py            # Benchmarks our model vs spaCy vs Presidio
+├── test_detector.py               # Test suite
+├── example_client.py              # API client demo
+├── Makefile                       # Convenience targets
+├── Dockerfile
+└── requirements.txt
 ```
+
+## Datasets
+
+Ten datasets are downloaded from HuggingFace and consolidated into a unified BIO-tagged format:
+
+| Dataset | Rows | Domain |
+|---|---|---|
+| ai4privacy/pii-masking-400k | ~400k | General, 63 PII classes |
+| ai4privacy/pii-masking-300k | ~300k | General + Finance (FinPII-80k) |
+| gretelai/synthetic_pii_finance_multilingual | ~56k | Finance (100 doc types) |
+| nvidia/Nemotron-PII | ~100k | General (50+ industries) |
+| wikiann (en) | ~20k | Wikipedia, PER/ORG/LOC only |
+| Babelscape/multinerd (en) | varies | Wikipedia + news, 15 types |
+| DFKI-SLT/few-nerd | ~188k | Wikipedia, 66 fine-grained types |
+| conll2003 | ~14k | News (Reuters), 4 types |
+| nlpaueb/finer-139 | ~1.1M | Finance (SEC filings), 139 XBRL tags |
+| Isotonic/pii-masking-200k | ~200k | General, 54 PII classes |
+
+finer-139 is capped at 150k records during data preparation. Entity types with fewer than 500 B- mentions globally are collapsed to O.
 
 ## Quick Start
 
-### 1. Installation
+### 1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
-pip install -r requirements-api.txt
 ```
 
-### 2. Run Complete Pipeline
+### 2. Run the data pipeline
 
 ```bash
-python run_pipeline.py
+python run_data_pipeline.py
 ```
 
-This will:
-- Download and prepare datasets (CoNLL-2003 + synthetic PII)
-- Fine-tune BERT model for PII detection
-- Evaluate on test set
-- Save model to `./models/best_model`
+This downloads all datasets, normalises them into BIO format, drops rare entity types, and writes stratified 80/10/10 train/val/test splits.
 
-### 3. Test the Model
+Skip steps you have already run:
+
+```bash
+python run_data_pipeline.py --skip-download
+python run_data_pipeline.py --skip-download --skip-consolidate
+```
+
+### 3. Run the training pipeline
+
+```bash
+python run_training_pipeline.py
+```
+
+This downloads `microsoft/deberta-v3-base` and fine-tunes it. The best checkpoint is saved to `./models/best_model`.
+
+Skip the model download if already done:
+
+```bash
+python run_training_pipeline.py --skip-download
+```
+
+### 4. Run tests
 
 ```bash
 python test_detector.py
 ```
 
-### 4. Use in Python Code
-
-```python
-from src.inference import PIIDetector
-
-detector = PIIDetector(model_path="./models/best_model")
-
-text = "My email is john@example.com and phone is 555-1234"
-result = detector.detect(text)
-
-if result:
-    print(f"PII detected: {result['pii_types']}")
-    print(f"Entities: {result['entities']}")
-else:
-    print("No PII detected")
-```
-
-## Detailed Usage
-
-### Data Preparation
-
-Collect and prepare training data:
+### 5. Start the API server
 
 ```bash
-python src/data_preparation.py
+python src/api.py --model-path ./models/best_model
 ```
 
-This creates:
-- `data/train.jsonl` - Training set
-- `data/val.jsonl` - Validation set
-- `data/test.jsonl` - Test set
-- `data/label_mapping.json` - Label definitions
-
-### Model Training
-
-Train a custom PII detection model:
+Or via Make:
 
 ```bash
-python src/train.py
+make api
 ```
 
-Options:
-- `model_name`: Base model (bert-base-cased, roberta-base, microsoft/deberta-v3-base)
-- `num_epochs`: Training epochs (default: 5)
-- `batch_size`: Batch size (default: 16)
-- `learning_rate`: Learning rate (default: 5e-5)
+## Training Configuration
 
-Or use the pipeline with custom settings:
+Default hyperparameters (`run_training_pipeline.py`):
+
+| Parameter | Default |
+|---|---|
+| Base model | microsoft/deberta-v3-base |
+| Batch size | 16 |
+| Gradient accumulation | 4 (effective batch = 64) |
+| Learning rate | 2e-5 |
+| Epochs | 10 |
+| Max sequence length | 512 |
+| Warmup ratio | 0.06 |
+| Weight decay | 0.01 |
+| Early stopping patience | 3 |
+| Eval/save every | 2000 steps |
+
+Override any parameter:
 
 ```bash
-python run_pipeline.py \
-    --model-name roberta-base \
-    --num-epochs 10 \
-    --batch-size 32 \
-    --learning-rate 3e-5
+python run_training_pipeline.py \
+    --batch-size 8 \
+    --grad-accum 8 \
+    --epochs 5 \
+    --max-length 256 \
+    --gradient-checkpointing
 ```
 
-### Inference
+Resume from a checkpoint:
 
-#### Single Text Detection
+```bash
+python run_training_pipeline.py --skip-download --resume-from-checkpoint
+```
+
+## Inference
+
+### PIIDetector (single-text / sequential batch)
 
 ```python
 from src.inference import PIIDetector
 
 detector = PIIDetector(
     model_path="./models/best_model",
-    confidence_threshold=0.5
+    confidence_threshold=0.5,
 )
 
-result = detector.detect("Contact John at john@email.com")
+result = detector.detect("My email is alice@example.com and SSN is 123-45-6789")
+print(result.has_pii)        # True
+print(result.redacted_text)  # "My email is [REDACTED] and SSN is [REDACTED]"
+print(result.pii_types)      # ["EMAIL", "SSN"]
+print(result.entities)
+# [
+#   {"text": "alice@example.com", "type": "EMAIL", "start": 12, "end": 29, "confidence": 0.97},
+#   {"text": "123-45-6789", "type": "SSN", "start": 39, "end": 50, "confidence": 0.95},
+# ]
 ```
 
-Returns:
-```python
-{
-    "has_pii": True,
-    "pii_types": ["PERSON", "EMAIL"],
-    "entities": [
-        {"text": "John", "type": "PERSON", "confidence": 0.95},
-        {"text": "john@email.com", "type": "EMAIL", "confidence": 0.98}
-    ],
-    "message": "PII detected in input text"
-}
-```
+`detect()` always returns a `PIIResult` dataclass. `has_pii` is False and `error` is set on per-item inference failures, so batch callers can continue processing.
 
-Or `None` if no PII detected.
-
-#### Batch Processing
-
-```python
-texts = [
-    "My name is Alice",
-    "The weather is nice",
-    "Call me at 555-0100"
-]
-
-results = detector.batch_detect(texts)
-stats = detector.get_pii_statistics(results)
-```
-
-#### Fast Batch Processing
+### FastPIIDetector (padded-batch inference)
 
 ```python
 from src.inference import FastPIIDetector
 
 detector = FastPIIDetector(
     model_path="./models/best_model",
-    batch_size=32
+    confidence_threshold=0.5,
+    batch_size=32,
 )
 
-results = detector.batch_detect_optimized(large_text_list)
+texts = ["Contact Alice at alice@example.com", "The weather is nice"]
+results = detector.batch_detect(texts)
+stats = detector.get_pii_statistics(results)
 ```
+
+`FastPIIDetector` pads inputs and runs a single forward pass per batch. Use this for high-throughput pipelines.
+
+### PIIResult fields
+
+| Field | Type | Description |
+|---|---|---|
+| `has_pii` | bool | True if any entity found above threshold |
+| `redacted_text` | str | Input with PII spans replaced by `[REDACTED]` |
+| `pii_types` | list[str] | Sorted unique entity types found |
+| `entities` | list[dict] | Per-entity: text, type, start, end, confidence |
+| `error` | str or None | Set on per-item failure; None on success |
 
 ## REST API
 
-### Start API Server
+### Endpoints
 
-```bash
-python src/api.py --model-path ./models/best_model --port 5000
-```
-
-### API Endpoints
-
-#### 1. Health Check
+#### GET /health
 
 ```bash
 curl http://localhost:5000/health
 ```
 
-Response:
 ```json
-{
-  "status": "healthy",
-  "model_loaded": true
-}
+{"status": "healthy", "model_loaded": true}
 ```
 
-#### 2. Single Text Detection
+#### GET /info
+
+Returns model path, device, confidence threshold, supported PII types, num_labels, batch_size.
+
+#### POST /detect
 
 ```bash
 curl -X POST http://localhost:5000/detect \
@@ -197,222 +225,138 @@ curl -X POST http://localhost:5000/detect \
   -d '{"text": "Email me at user@example.com"}'
 ```
 
-Response:
 ```json
 {
   "has_pii": true,
+  "redacted_text": "Email me at [REDACTED]",
   "pii_types": ["EMAIL"],
-  "entities": [
-    {
-      "text": "user@example.com",
-      "type": "EMAIL",
-      "confidence": 0.97
-    }
-  ],
-  "message": "PII detected in input text"
+  "entities": [{"text": "user@example.com", "type": "EMAIL", "start": 12, "end": 28, "confidence": 0.97}],
+  "error": null
 }
 ```
 
-#### 3. Batch Detection
+#### POST /detect/batch
 
 ```bash
 curl -X POST http://localhost:5000/detect/batch \
   -H "Content-Type: application/json" \
-  -d '{
-    "texts": [
-      "My name is John",
-      "The sky is blue",
-      "SSN: 123-45-6789"
-    ]
-  }'
+  -d '{"texts": ["My name is John", "SSN: 123-45-6789"], "return_stats": true}'
 ```
 
-Response:
-```json
-{
-  "results": [
-    {"has_pii": true, ...},
-    null,
-    {"has_pii": true, ...}
-  ],
-  "statistics": {
-    "total_texts": 3,
-    "texts_with_pii": 2,
-    "texts_without_pii": 1,
-    "pii_rate": 0.67,
-    "pii_type_distribution": {
-      "PERSON": 1,
-      "SSN": 1
-    }
-  }
-}
-```
+Returns `{"results": [...], "statistics": {...}}`. Every entry in `results` is a PIIResult dict — never null.
 
-#### 4. Model Info
+#### POST /detect/file
+
+Accepts `.txt`, `.csv`, `.xlsx`, `.xls` uploads (max 50 MB).
 
 ```bash
-curl http://localhost:5000/info
+curl -X POST http://localhost:5000/detect/file \
+  -F "file=@data.csv" \
+  -F "columns=name,email"
 ```
 
-## Docker Deployment
+For CSV/Excel, `columns` is an optional comma-separated list of column names to process. Omit to process all columns. The response includes per-cell results and a fully redacted copy of the records.
 
-### Build Image
+For plain text, each non-blank line is processed separately.
+
+All error responses use the shape: `{"error": "<ExceptionClassName>", "message": "...", "details": {...}}`.
+
+
+### Deployment
 
 ```bash
-docker build -t pii-detector .
+# 4-worker gunicorn
+make api-prod
+
+# Docker
+make docker-build
+make docker-run
+make docker-run-gpu
 ```
 
-### Run Container
+### API client demo
 
 ```bash
-docker run -p 5000:5000 pii-detector
+python example_client.py --host http://localhost:5000
 ```
 
-### With Custom Model
+Demonstrates all four endpoints including file upload for `.txt` and `.csv`.
+
+## Benchmarking
+
+Evaluates our model against spaCy `en_core_web_trf` and Microsoft Presidio on the test split using seqeval span-level F1.
 
 ```bash
-docker run -p 5000:5000 \
-  -v /path/to/model:/app/models/best_model \
-  pii-detector
+# Download spaCy models first
+make download-deps
+
+# Run benchmark on full test set
+make benchmark
+
+# Limit to first 500 records
+make benchmark N=500
+
+# Skip individual systems
+python run_benchmarking.py --skip-spacy
+python run_benchmarking.py --skip-presidio
 ```
 
-## Supported PII Types
+Entity type normalisation maps are defined in `run_benchmarking.py` (`SPACY_LABEL_MAP`, `PRESIDIO_LABEL_MAP`) to align external systems to our label set before evaluation.
 
-- **PERSON**: Person names
-- **EMAIL**: Email addresses
-- **PHONE**: Phone numbers
-- **SSN**: Social Security Numbers
-- **CC**: Credit card numbers
-- **ADDRESS**: Physical addresses
-- **DATE**: Dates of birth
-- **ORG**: Organizations
-- **LOC**: Locations
+Results are written to `./benchmark_results/benchmark_results.json` and per-system report JSONs.
 
-## Configuration
+## Makefile targets
 
-### Model Selection
-
-Choose base model based on requirements:
-
-| Model | Size | Speed | Accuracy |
-|-------|------|-------|----------|
-| bert-base-cased | 110M | Fast | Good |
-| roberta-base | 125M | Medium | Better |
-| deberta-v3-base | 184M | Slow | Best |
-
-### Confidence Threshold
-
-Adjust sensitivity:
-
-```python
-detector = PIIDetector(
-    model_path="./models/best_model",
-    confidence_threshold=0.7  # Higher = more conservative
-)
+```
+make install            Install dependencies
+make download-deps      Download spaCy models for benchmarking
+make data               Full data pipeline (download + consolidate + prepare)
+make data SKIP=1        Skip download, re-run consolidation + preparation
+make train              Download base model + fine-tune
+make train SKIP=1       Skip model download, fine-tune only
+make pipeline           data + train
+make test               Run test suite
+make benchmark          Benchmark all three systems
+make benchmark N=500    Benchmark on first 500 records
+make api                Start API server (dev mode)
+make api-prod           Start API via gunicorn (4 workers)
+make docker-build       Build Docker image
+make docker-run         Run Docker container
+make clean              Remove __pycache__ and .pyc files
+make clean-models       Remove trained model checkpoints
+make clean-data         Remove data splits
+make clean-all          Remove everything generated
 ```
 
-## Performance
+## Custom exceptions
 
-Expected metrics on test set:
+All exceptions inherit from `PIIDetectionError` and expose a `to_dict()` method used by the API error handler.
 
-- Precision: 90-95%
-- Recall: 85-92%
-- F1 Score: 88-93%
-
-Inference speed (single text):
-- CPU: ~50-100ms
-- GPU: ~10-20ms
-
-Batch processing (32 texts):
-- CPU: ~500ms
-- GPU: ~100ms
-
-## Production Deployment
-
-### Gunicorn (Recommended)
-
-```bash
-pip install gunicorn
-gunicorn -w 4 -b 0.0.0.0:5000 src.api:app
+```
+PIIDetectionError
+├── ModelError
+│   ├── ModelNotFoundError
+│   ├── ModelLoadError
+│   └── ModelInferenceError
+├── InputError
+│   ├── EmptyInputError
+│   ├── InputTooLargeError
+│   └── InvalidInputTypeError
+├── FileParsingError
+│   ├── UnsupportedFileTypeError
+│   ├── FileReadError
+│   ├── TextFileParsingError
+│   ├── CSVParsingError
+│   └── ExcelParsingError
+└── APIError
+    ├── MissingFieldError
+    └── InvalidFieldError
 ```
 
-### System Service
+## Author
 
-Create `/etc/systemd/system/pii-detector.service`:
-
-```ini
-[Unit]
-Description=PII Detection API
-After=network.target
-
-[Service]
-Type=simple
-User=www-data
-WorkingDirectory=/opt/pii-detector
-Environment="MODEL_PATH=/opt/pii-detector/models/best_model"
-ExecStart=/usr/bin/gunicorn -w 4 -b 0.0.0.0:5000 src.api:app
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Start service:
-```bash
-sudo systemctl start pii-detector
-sudo systemctl enable pii-detector
-```
-
-## Monitoring
-
-Add logging:
-
-```python
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-```
-
-Track metrics:
-- Detection latency
-- PII detection rate
-- False positive/negative rates
-- API request volume
-
-## Troubleshooting
-
-### Out of Memory
-
-Reduce batch size:
-```bash
-python src/train.py --batch-size 8
-```
-
-### Slow Inference
-
-Use FastPIIDetector with GPU:
-```python
-from src.inference import FastPIIDetector
-detector = FastPIIDetector(model_path="./models/best_model", batch_size=64)
-```
-
-### Low Accuracy
-
-- Increase training epochs
-- Use larger base model (RoBERTa, DeBERTa)
-- Add domain-specific training data
-- Adjust confidence threshold
-
-## Research References
-
-1. Devlin et al. (2018) - BERT: Pre-training of Deep Bidirectional Transformers
-2. Liu et al. (2019) - RoBERTa: A Robustly Optimized BERT Pretraining Approach
-3. Dernoncourt et al. (2017) - De-identification of Patient Notes with Recurrent Neural Networks
-4. Lample et al. (2016) - Neural Architectures for Named Entity Recognition
+Pritesh Jha
 
 ## License
 
-MIT License
+MIT
