@@ -1,16 +1,30 @@
 """
 Fine-tunes microsoft/deberta-v3-base for PII named entity recognition.
 
-Cloud V100-SXM2-16GB (this machine):
-    python src/train.py
+Eval strategy
+-------------
+Intra-training eval (every --eval-steps) runs on val_1p.jsonl (~1% of val,
+~1,400 records). This keeps each eval pass to ~seconds rather than hours.
+Early stopping and best-checkpoint selection are based on this fast subset.
+
+Final eval (after training completes) runs on the full test.jsonl (~140k
+records) via trainer.predict(), giving a true held-out benchmark number.
+
+Pre-tokenize the eval subset once before training (seconds, not hours):
+    python src/train.py --pretokenize-only
+    python src/train.py --use-pretokenized
+
+This Arrow-backed eval is the recommended path on V100. Without it, each
+eval pass tokenizes ~1,400 records on CPU in the dataloader, which is still
+fast (~5s) but Arrow eliminates that cost entirely.
+
+Cloud V100-SXM2-16GB:
+    python src/train.py --pretokenize-only
+    python src/train.py --use-pretokenized --skip-download ...
 
 Local GPU (<=8GB VRAM):
     PYTORCH_ALLOC_CONF=expandable_segments:True python src/train.py \
         --batch-size 2 --grad-accum 32 --gradient-checkpointing
-
-Pre-tokenize once (recommended for repeated runs):
-    python src/train.py --pretokenize-only
-    python src/train.py --use-pretokenized
 
 Notes on torch_compile
 -----------------------
@@ -391,7 +405,7 @@ class PIITrainer:
         print(f"pred_loss_only   : {self.prediction_loss_only}")
         print(f"Grad ckpt        : {'enabled' if self.use_gradient_checkpointing else 'disabled'}")
         print(f"Max length       : {self.max_length}")
-        print(f"Dataset mode     : {'pre-tokenized Arrow' if self.use_pretokenized else 'streaming JSONL'}")
+        print(f"Dataset mode     : {'val_1p Arrow' if self.use_pretokenized else 'val_1p streaming JSONL'} (intra-training eval)")
         if self.max_steps > 0:
             print(f"Max steps        : {self.max_steps} (overrides epochs)")
 
@@ -401,13 +415,28 @@ class PIITrainer:
 
     def pretokenize(self, num_proc: int = 4):
         """
-        Pre-tokenize all three splits and save to Arrow format.
-        Call once before training with --use-pretokenized.
+        Pre-tokenize the eval subsets (val_1p and test_1p) and save as Arrow.
+
+        Only the ~1% subsets are pre-tokenized, not the full val/test splits.
+        This runs in seconds and produces small Arrow files (~10-20 MB each).
+        The full test split is evaluated at the end of training via streaming,
+        so it does not need to be pre-tokenized.
+
+        Call once before training:
+            python src/train.py --pretokenize-only
+        Then train with:
+            python src/train.py --use-pretokenized ...
         """
         self.pretokenized_dir.mkdir(parents=True, exist_ok=True)
-        for split in ("train", "val", "test"):
+        for split in ("val_1p", "test_1p"):
+            jsonl_path = DATA_DIR / f"{split}.jsonl"
+            if not jsonl_path.exists():
+                raise FileNotFoundError(
+                    f"{jsonl_path} not found. "
+                    "Re-run the data pipeline first: python run_data_pipeline.py"
+                )
             pretokenize_split(
-                jsonl_path=DATA_DIR / f"{split}.jsonl",
+                jsonl_path=jsonl_path,
                 out_dir=self.pretokenized_dir,
                 tokenizer=self.tokenizer,
                 label2id=self.label2id,
@@ -418,36 +447,39 @@ class PIITrainer:
         print(f"\nPre-tokenized Arrow datasets saved to: {self.pretokenized_dir}")
 
     def load_datasets(self):
+        """
+        Training always streams from train.jsonl (full, 1.1M records).
+        Intra-training eval uses val_1p (Arrow or streaming JSONL, ~1,400 records).
+        Final eval (called after training) uses the full test.jsonl via streaming.
+        """
         print("\nLoading datasets ...")
 
-        if self.use_pretokenized:
-            self.train_ds = load_pretokenized("train", self.pretokenized_dir)
-            self.val_ds   = load_pretokenized("val",   self.pretokenized_dir)
-            self.test_ds  = load_pretokenized("test",  self.pretokenized_dir)
-            self.train_line_count = len(self.train_ds)
-            print(f"  Train (Arrow): {self.train_line_count:,}")
-            print(f"  Val   (Arrow): {len(self.val_ds):,}")
-            print(f"  Test  (Arrow): {len(self.test_ds):,}")
-        else:
-            # Streaming IterableDataset — no in-memory list
-            self.train_ds = PIIIterableDataset(
-                DATA_DIR / "train.jsonl", self.tokenizer, self.label2id, self.max_length
-            )
-            self.val_ds   = PIIIterableDataset(
-                DATA_DIR / "val.jsonl",   self.tokenizer, self.label2id, self.max_length
-            )
-            self.test_ds  = PIIIterableDataset(
-                DATA_DIR / "test.jsonl",  self.tokenizer, self.label2id, self.max_length
-            )
+        # Training dataset — always streaming, never loaded into RAM
+        self.train_ds = PIIIterableDataset(
+            DATA_DIR / "train.jsonl", self.tokenizer, self.label2id, self.max_length
+        )
+        print("  Counting training lines (byte scan) ...")
+        self.train_line_count = count_jsonl_lines(DATA_DIR / "train.jsonl")
+        print(f"  Train (streaming): {self.train_line_count:,}")
 
-            # Fast line count (byte scan, no JSON parsing)
-            print("  Counting training lines (byte scan) ...")
-            self.train_line_count = count_jsonl_lines(DATA_DIR / "train.jsonl")
-            val_lines  = count_jsonl_lines(DATA_DIR / "val.jsonl")
-            test_lines = count_jsonl_lines(DATA_DIR / "test.jsonl")
-            print(f"  Train (streaming): {self.train_line_count:,}")
-            print(f"  Val   (streaming): {val_lines:,}")
-            print(f"  Test  (streaming): {test_lines:,}")
+        # Intra-training eval dataset — val_1p (~1% of val, ~1,400 records)
+        if self.use_pretokenized:
+            self.val_ds = load_pretokenized("val_1p", self.pretokenized_dir)
+            print(f"  Val eval (Arrow val_1p): {len(self.val_ds):,} records")
+        else:
+            self.val_ds = PIIIterableDataset(
+                DATA_DIR / "val_1p.jsonl", self.tokenizer, self.label2id, self.max_length
+            )
+            val_1p_lines = count_jsonl_lines(DATA_DIR / "val_1p.jsonl")
+            print(f"  Val eval (streaming val_1p): {val_1p_lines:,} records")
+
+        # Full test set — loaded lazily, only used in evaluate() at the end
+        # Kept as a streaming dataset to avoid loading 140k records into RAM.
+        self.test_ds = PIIIterableDataset(
+            DATA_DIR / "test.jsonl", self.tokenizer, self.label2id, self.max_length
+        )
+        test_lines = count_jsonl_lines(DATA_DIR / "test.jsonl")
+        print(f"  Test (streaming, final eval only): {test_lines:,} records")
 
     # ------------------------------------------------------------------
     # Training
@@ -628,8 +660,14 @@ class PIITrainer:
     # ------------------------------------------------------------------
 
     def evaluate(self, trainer):
+        """
+        Final evaluation on the full test set after training completes.
+        This is the only place the full 140k test split is evaluated.
+        Intra-training eval used val_1p; this gives the true held-out number.
+        eval_accumulation_steps is applied here too to prevent OOM.
+        """
         print("\n" + "=" * 60)
-        print("EVALUATION ON TEST SET")
+        print("FINAL EVALUATION ON FULL TEST SET")
         print("=" * 60)
 
         preds_output = trainer.predict(self.test_ds, metric_key_prefix="test")

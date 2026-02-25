@@ -214,12 +214,15 @@ def main():
     parser.add_argument(
         "--pretokenize-only",
         action="store_true",
-        help="Tokenize all splits to Arrow format and exit. Run once before training.",
+        help=(
+            "Tokenize val_1p and test_1p subsets to Arrow format and exit. "
+            "Run once after data prep, before training. Fast (~seconds)."
+        ),
     )
     parser.add_argument(
         "--use-pretokenized",
         action="store_true",
-        help="Load Arrow datasets instead of streaming JSONL. Requires --pretokenize-only first.",
+        help="Load Arrow val_1p for intra-training eval. Requires --pretokenize-only first.",
     )
     parser.add_argument(
         "--pretokenize-num-proc",

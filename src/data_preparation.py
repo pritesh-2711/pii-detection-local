@@ -3,12 +3,20 @@ Loads the consolidated PII dataset, applies:
   - finer_139 source cap (150k records)
   - rare entity type dropping (< 500 B- mentions -> collapsed to O)
   - stratified 80/10/10 split by source
+  - 1% eval subsets: data/val_1p.jsonl and data/test_1p.jsonl
 
 Outputs:
   data/train.jsonl
   data/val.jsonl
   data/test.jsonl
+  data/val_1p.jsonl      <- ~1,400 records, used for fast intra-training eval
+  data/test_1p.jsonl     <- ~1,400 records, used for fast milestone checks
   data/label_mapping.json
+
+The 1p subsets are stratified by source so entity type distribution matches
+the full splits. They are written once here and never regenerated unless you
+re-run data preparation. Arrow pre-tokenization targets these subsets, not
+the full val/test splits, so pre-tokenization is fast (~seconds).
 """
 
 import json
@@ -22,7 +30,7 @@ FINER_CAP = 150_000
 RARE_THRESHOLD = 500
 TRAIN_RATIO = 0.8
 VAL_RATIO = 0.1
-# test gets the remainder (0.1)
+SUBSET_FRACTION = 0.01   # 1% of val/test for fast intra-training eval
 RANDOM_SEED = 42
 
 
@@ -62,11 +70,6 @@ def cap_finer(records: list, cap: int, seed: int) -> list:
 # ---------------------------------------------------------------------------
 
 def drop_rare_entities(records: list, threshold: int) -> tuple:
-    """
-    Count B- mentions per entity type globally.
-    Any type below threshold has all its B-/I- labels replaced with O.
-    Returns (updated_records, kept_types, dropped_types).
-    """
     mention_counts = Counter()
     for rec in records:
         for lbl in rec["labels"]:
@@ -112,10 +115,6 @@ def drop_rare_entities(records: list, threshold: int) -> tuple:
 
 def stratified_split(records: list, train_ratio: float, val_ratio: float,
                      seed: int) -> tuple:
-    """
-    For each source independently: shuffle, split 80/10/10.
-    Concatenate across sources.
-    """
     rng = random.Random(seed)
     by_source = defaultdict(list)
     for rec in records:
@@ -142,12 +141,35 @@ def stratified_split(records: list, train_ratio: float, val_ratio: float,
     print(f"  {'-'*30} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
     print(f"  {'TOTAL':<30} {len(train)+len(val)+len(test):>8,} {len(train):>8,} {len(val):>8,} {len(test):>8,}")
 
-    # Final shuffle of each split so sources are interleaved during training
     rng.shuffle(train)
     rng.shuffle(val)
     rng.shuffle(test)
 
     return train, val, test
+
+
+# ---------------------------------------------------------------------------
+# Stratified subset (1% of a split, preserving source distribution)
+# ---------------------------------------------------------------------------
+
+def make_stratified_subset(records: list, fraction: float, seed: int) -> list:
+    """
+    Sample `fraction` of records while preserving per-source proportions.
+    Guarantees at least 1 record per source.
+    Used to produce val_1p.jsonl and test_1p.jsonl.
+    """
+    rng = random.Random(seed)
+    by_source = defaultdict(list)
+    for rec in records:
+        by_source[rec["source"]].append(rec)
+
+    subset = []
+    for source, recs in sorted(by_source.items()):
+        n = max(1, int(len(recs) * fraction))
+        subset.extend(rng.sample(recs, min(n, len(recs))))
+
+    rng.shuffle(subset)
+    return subset
 
 
 # ---------------------------------------------------------------------------
@@ -208,13 +230,28 @@ def prepare():
     # 5. Stratified split
     train, val, test = stratified_split(records, TRAIN_RATIO, VAL_RATIO, RANDOM_SEED)
 
-    # 6. Save splits
+    # 6. Save full splits
     print("\nSaving splits ...")
     save_split(train, OUTPUT_DIR / "train.jsonl")
-    save_split(val, OUTPUT_DIR / "val.jsonl")
-    save_split(test, OUTPUT_DIR / "test.jsonl")
+    save_split(val,   OUTPUT_DIR / "val.jsonl")
+    save_split(test,  OUTPUT_DIR / "test.jsonl")
 
-    # 7. Save label mapping
+    # 7. Save 1% eval subsets (stratified by source)
+    print(f"\nCreating {SUBSET_FRACTION:.0%} eval subsets ...")
+    val_1p  = make_stratified_subset(val,  SUBSET_FRACTION, RANDOM_SEED)
+    test_1p = make_stratified_subset(test, SUBSET_FRACTION, RANDOM_SEED)
+    save_split(val_1p,  OUTPUT_DIR / "val_1p.jsonl")
+    save_split(test_1p, OUTPUT_DIR / "test_1p.jsonl")
+    print(
+        f"  val_1p  : {len(val_1p):,} records "
+        f"({len(val_1p)/len(val)*100:.1f}% of val)"
+    )
+    print(
+        f"  test_1p : {len(test_1p):,} records "
+        f"({len(test_1p)/len(test)*100:.1f}% of test)"
+    )
+
+    # 8. Save label mapping
     mapping = {
         "labels": labels,
         "label2id": label2id,
@@ -237,6 +274,8 @@ def prepare():
     print(f"  Train records       : {len(train):,}")
     print(f"  Val records         : {len(val):,}")
     print(f"  Test records        : {len(test):,}")
+    print(f"  val_1p records      : {len(val_1p):,}  <- fast intra-training eval")
+    print(f"  test_1p records     : {len(test_1p):,}  <- fast milestone checks")
 
     return mapping
 
